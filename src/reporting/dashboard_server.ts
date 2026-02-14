@@ -4486,25 +4486,45 @@ document.querySelectorAll('.con-sub-tab').forEach(btn=>{
   setInterval(fetchTrades,2000);
 })();
 
+/* ─── Fetch dashboard data via REST (fallback + initial load) ─── */
+async function fetchDashboardData(){
+  try{
+    const r = await fetch('/api/data');
+    const d = await r.json();
+    currentData = d;
+    $('#hdr-ts').textContent = new Date(d.generatedAt).toLocaleString();
+    renderSummary(d);
+    renderWallets(d.wallets);
+  }catch(e){console.error('fetchDashboardData error',e)}
+}
+
 /* ─── Real-time SSE stream ─── */
 let sse = null;
+let sseConnected = false;
 function connectSSE(){
   if(sse) sse.close();
-  sse = new EventSource('/api/stream');
-  sse.addEventListener('dashboard', function(ev){
-    try{
-      const d = JSON.parse(ev.data);
-      currentData = d;
-      $('#hdr-ts').textContent = new Date(d.generatedAt).toLocaleString();
-      renderSummary(d);
-      renderWallets(d.wallets);
-    }catch(e){console.error('SSE parse error',e)}
-  });
-  sse.onerror = function(){
-    // reconnect after 2s on error
-    sse.close();
-    setTimeout(connectSSE, 2000);
-  };
+  sseConnected = false;
+  try{
+    sse = new EventSource('/api/stream');
+    sse.addEventListener('dashboard', function(ev){
+      try{
+        sseConnected = true;
+        const d = JSON.parse(ev.data);
+        currentData = d;
+        $('#hdr-ts').textContent = new Date(d.generatedAt).toLocaleString();
+        renderSummary(d);
+        renderWallets(d.wallets);
+      }catch(e){console.error('SSE parse error',e)}
+    });
+    sse.onerror = function(){
+      sseConnected = false;
+      sse.close();
+      setTimeout(connectSSE, 3000);
+    };
+  }catch(e){
+    sseConnected = false;
+    setTimeout(connectSSE, 3000);
+  }
 }
 
 /* ─── Refresh for non-SSE data (wallet list, etc) ─── */
@@ -4515,10 +4535,13 @@ async function refresh(){
     renderWalletTable(walletList);
     populateAnalyticsDropdown();
     if(strategies.length) renderStrategies(strategies, walletList);
+    /* If SSE is not connected, poll /api/data as fallback */
+    if(!sseConnected) await fetchDashboardData();
   }catch(e){$('#hdr-ts').textContent='Error \u2014 retrying\u2026'}
 }
 
 /* ─── Boot ─── */
+fetchDashboardData();
 populateStrategyDropdown().then(()=>refresh());
 connectSSE();
 setInterval(refresh, 5000);
