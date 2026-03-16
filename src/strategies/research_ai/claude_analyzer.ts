@@ -1,4 +1,7 @@
-import { execFile } from 'child_process';
+import { execFile, exec } from 'child_process';
+import { writeFileSync, readFileSync, unlinkSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { logger } from '../../reporting/logs';
 
 export interface MarketAnalysis {
@@ -52,16 +55,27 @@ Respond ONLY: {"direction":"YES"|"NO"|"SKIP","confidence":0.0-1.0,"edge":0.0-0.1
 
 function runCodex(prompt: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = execFile(
-      'codex',
-      ['--quiet', '--full-stdout', prompt],
-      { timeout: timeoutMs, maxBuffer: 1024 * 1024 },
+    const outFile = join(tmpdir(), `codex-out-${Date.now()}.txt`);
+
+    // Use 'codex exec' for non-interactive mode with output file
+    const child = exec(
+      `codex exec -o ${outFile} --skip-git-repo-check --ephemeral -- ${JSON.stringify(prompt)}`,
+      { timeout: timeoutMs, maxBuffer: 1024 * 1024, cwd: '/tmp' },
       (error, stdout, stderr) => {
-        if (error) {
-          reject(new Error(`codex failed: ${error.message} stderr=${stderr}`));
+        let output = '';
+        try {
+          output = readFileSync(outFile, 'utf-8').trim();
+          unlinkSync(outFile);
+        } catch {
+          // Output file not created, use stdout
+          output = stdout.trim();
+        }
+
+        if (error && !output) {
+          reject(new Error(`codex failed: ${error.message}`));
           return;
         }
-        resolve(stdout.trim());
+        resolve(output);
       },
     );
   });
@@ -73,7 +87,7 @@ export class ClaudeAnalyzer {
   private minIntervalMs = 10_000; // 10s between calls (CLI is slower)
   private cache = new Map<string, { analysis: MarketAnalysis; timestamp: number }>();
   private cacheTtlMs = 600_000; // 10 min cache (CLI calls are expensive)
-  private callTimeoutMs = 30_000; // 30s timeout per call
+  private callTimeoutMs = 60_000; // 60s timeout per call (codex exec is slow)
 
   constructor() {
     // Check if codex CLI is available
