@@ -1,6 +1,6 @@
-# Polymarket Trading Bot — Docker management
-IMAGE_NAME := "polymarket-trading-bot"
-DOCKER_USER := "byrdziak"
+# PolyPatronBot — Docker management
+IMAGE_NAME := "polypatronbot"
+DOCKER_USER := "bglglzd"
 
 # Default: show help
 default: help
@@ -12,9 +12,9 @@ help:
 build:
 	docker build -t {{IMAGE_NAME}}:latest .
 
-# Run locally (paper trading mode, dashboard on 30330)
+# Run locally (paper trading mode, dashboard on 3000)
 run:
-	docker run -d -p 30330:3000 --name {{IMAGE_NAME}} {{IMAGE_NAME}}:latest
+	docker run -d -p 3000:3000 --name {{IMAGE_NAME}} {{IMAGE_NAME}}:latest
 
 # Logs
 logs:
