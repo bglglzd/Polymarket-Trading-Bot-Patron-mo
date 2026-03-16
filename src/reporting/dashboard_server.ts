@@ -748,7 +748,7 @@ export class DashboardServer {
     this.server.listen(this.port, () => {
       logger.info(
         { port: this.port, url: `http://localhost:${this.port}/dashboard` },
-        'Dashboard server listening',
+        'PolyPatronBot dashboard listening',
       );
     });
 
@@ -1316,7 +1316,7 @@ function getDashboardHtml(): string {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PolyMarket Strategies</title>
+<title>PolyPatronBot Dashboard</title>
 <style>
 /* ═══ Design tokens ═══ */
 :root {
@@ -1717,7 +1717,7 @@ footer{text-align:center;padding:24px;color:var(--muted);font-size:11px;border-t
 
 <!-- ═══ HEADER ═══ -->
 <div class="header">
-  <div class="logo"><span>Poly</span>Market Strategies</div>
+  <div class="logo"><span>Poly</span>PatronBot</div>
   <div class="tabs">
     <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
     <button class="tab-btn" data-tab="markets">Markets</button>

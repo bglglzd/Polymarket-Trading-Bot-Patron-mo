@@ -1,10 +1,10 @@
 {
-  "name": "polymarket-multi-strategy-platform",
-  "version": "0.1.0",
+  "name": "polypatronbot",
+  "version": "1.0.0",
   "private": true,
   "type": "commonjs",
   "bin": {
-    "bot": "dist/cli.js"
+    "polypatron": "dist/cli.js"
   },
   "scripts": {
     "dev": "tsx src/cli.ts start --config config.yaml",
@@ -16,6 +16,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "better-sqlite3": "^12.6.2",
     "commander": "^12.1.0",
     "pino": "^9.3.2",

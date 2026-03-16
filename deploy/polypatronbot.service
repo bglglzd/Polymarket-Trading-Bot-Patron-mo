@@ -1,0 +1,24 @@
+[Unit]
+Description=PolyPatronBot - AI-powered Polymarket Trading Platform
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/polypatronbot-new
+ExecStart=/usr/bin/node dist/cli.js start --config config.yaml
+Restart=always
+RestartSec=10
+Environment=NODE_ENV=production
+EnvironmentFile=/opt/polypatronbot-new/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polypatronbot
+
+# Security
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

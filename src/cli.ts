@@ -172,9 +172,9 @@ function readState(): Record<string, unknown> {
 }
 
 program
-  .name('bot')
-  .description('Polymarket multi-strategy trading platform')
-  .version('0.1.0');
+  .name('polypatron')
+  .description('PolyPatronBot — AI-powered Polymarket trading platform')
+  .version('1.0.0');
 
 program
   .command('start')
