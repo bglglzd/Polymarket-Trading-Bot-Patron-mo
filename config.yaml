@@ -2,19 +2,32 @@
 # Single-wallet setup with Claude AI analysis
 
 environment:
-  enable_live_trading: false  # Set to true + ENABLE_LIVE_TRADING=true env var for real trades
+  enable_live_trading: true
 
 wallets:
-  - id: patron_main
-    mode: PAPER
+  # Paper wallet (paused for now)
+  # - id: patron_paper
+  #   mode: PAPER
+  #   strategy: ai_forecast
+  #   capital: 100
+  #   risk_limits:
+  #     max_position_size: 20
+  #     max_exposure_per_market: 30
+  #     max_daily_loss: 10
+  #     max_open_trades: 10
+  #     max_drawdown: 0.10
+
+  # LIVE wallet — real money
+  - id: patron_live
+    mode: LIVE
     strategy: ai_forecast
     capital: 100
     risk_limits:
-      max_position_size: 20
-      max_exposure_per_market: 30
-      max_daily_loss: 10
-      max_open_trades: 10
-      max_drawdown: 0.10
+      max_position_size: 10
+      max_exposure_per_market: 20
+      max_daily_loss: 5
+      max_open_trades: 5
+      max_drawdown: 0.05
 
 strategy_config:
   ai_forecast:
