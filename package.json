@@ -16,9 +16,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.78.0",
     "better-sqlite3": "^12.6.2",
     "commander": "^12.1.0",
+    "openai": "^6.29.0",
     "pino": "^9.3.2",
     "pino-pretty": "^11.2.0",
     "yaml": "^2.4.5"

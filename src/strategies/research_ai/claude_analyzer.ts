@@ -1,4 +1,4 @@
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { logger } from '../../reporting/logs';
 
 export interface MarketAnalysis {
@@ -30,66 +30,53 @@ interface MarketContext {
   };
 }
 
-const ANALYSIS_PROMPT = `You are PolyPatronBot's AI trading analyst for Polymarket prediction markets. Your job is to analyze a specific market and provide a trading recommendation.
-
-MARKET DATA:
-- Question: {question}
-- Current YES price: ${'{yesPrice}'} (probability the market resolves YES)
-- Current NO price: ${'{noPrice}'}
-- Bid-Ask Spread: {spread} bps
-- 24h Volume: ${'{volume}'}
-- Liquidity: ${'{liquidity}'}
-- 1-Day Price Change: {dayChange}%
-- 1-Week Price Change: {weekChange}%
-- End Date: {endDate}
-- Recent price trend (last 10 data points): {priceHistory}
-
-QUANTITATIVE SIGNALS (from our factor model):
-- Momentum: {momentum}
-- Mean Reversion: {meanReversion}
-- Volume-Price Divergence: {volumeDivergence}
-- Market Regime: {regime}
-- Price Acceleration: {acceleration}
-- Liquidity Quality: {liquidityQuality}
-
-ANALYSIS INSTRUCTIONS:
-1. Assess the market question — is the outcome becoming more or less likely based on available context?
-2. Analyze the price action — is the current price over/undervalued relative to true probability?
-3. Consider the quantitative signals — do they align with a clear direction?
-4. Evaluate risk — how close to resolution, how wide is the spread, is there enough liquidity?
+const SYSTEM_PROMPT = `You are PolyPatronBot's AI trading analyst for Polymarket prediction markets.
+You analyze markets and return ONLY a JSON trading recommendation. No markdown, no explanation outside JSON.
 
 RULES:
 - Only recommend a trade when you have genuine conviction (confidence > 0.5)
 - If the market is too uncertain, too close to 50/50, or signals conflict, recommend SKIP
 - Be conservative — a SKIP is always better than a losing trade
-- Edge should reflect how far the price is from true probability
+- Edge should reflect how far the price is from true probability (0.0 to 0.10)
 - Markets near resolution (< 1 day) with clear trends are higher confidence
 - Wide spreads (> 300 bps) reduce confidence
 - Low volume (< $1000) means SKIP
 
-Respond in EXACTLY this JSON format (no markdown, no explanation outside JSON):
-{
-  "direction": "YES" | "NO" | "SKIP",
-  "confidence": <0.0 to 1.0>,
-  "edge": <0.0 to 0.10>,
-  "reasoning": "<1-2 sentence explanation>",
-  "factors": ["<factor1>", "<factor2>", "<factor3>"]
-}`;
+Response format (ONLY this JSON, nothing else):
+{"direction":"YES"|"NO"|"SKIP","confidence":0.0-1.0,"edge":0.0-0.10,"reasoning":"1-2 sentences","factors":["factor1","factor2"]}`;
+
+function buildUserPrompt(ctx: MarketContext): string {
+  const priceHistoryStr = ctx.priceHistory
+    .slice(-10)
+    .map((p) => p.toFixed(4))
+    .join(', ');
+
+  return `Analyze this Polymarket market:
+
+Question: ${ctx.question}
+YES price: $${ctx.currentYesPrice.toFixed(2)} | NO price: $${ctx.currentNoPrice.toFixed(2)}
+Spread: ${ctx.spread.toFixed(0)} bps | Volume 24h: $${ctx.volume24h.toLocaleString()} | Liquidity: $${ctx.liquidity.toLocaleString()}
+1-Day change: ${(ctx.oneDayPriceChange ?? 0).toFixed(2)}% | 1-Week change: ${(ctx.oneWeekPriceChange ?? 0).toFixed(2)}%
+End date: ${ctx.endDate ?? 'unknown'}
+Price history (last 10): [${priceHistoryStr}]
+
+Quant signals: momentum=${ctx.quantSignals.momentum}, mean_reversion=${ctx.quantSignals.meanReversion}, vol_divergence=${ctx.quantSignals.volumeDivergence}, regime=${ctx.quantSignals.regime}, acceleration=${ctx.quantSignals.acceleration}, liquidity=${ctx.quantSignals.liquidityQuality}`;
+}
 
 export class ClaudeAnalyzer {
-  private client: Anthropic | null = null;
+  private client: OpenAI | null = null;
   private lastCallTime = 0;
-  private minIntervalMs = 5000; // Rate limit: max 1 call per 5 seconds
+  private minIntervalMs = 5000;
   private cache = new Map<string, { analysis: MarketAnalysis; timestamp: number }>();
-  private cacheTtlMs = 300_000; // Cache results for 5 minutes
+  private cacheTtlMs = 300_000; // 5 min cache
 
   constructor() {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
+    const apiKey = process.env.OPENAI_API_KEY;
     if (apiKey) {
-      this.client = new Anthropic({ apiKey });
-      logger.info('ClaudeAnalyzer initialized with API key');
+      this.client = new OpenAI({ apiKey });
+      logger.info('AI Analyzer initialized (OpenAI GPT-4o-mini)');
     } else {
-      logger.warn('ANTHROPIC_API_KEY not set — Claude AI analysis disabled, using quant-only mode');
+      logger.warn('OPENAI_API_KEY not set — AI analysis disabled, using quant-only mode');
     }
   }
 
@@ -108,27 +95,26 @@ export class ClaudeAnalyzer {
 
     // Rate limiting
     const now = Date.now();
-    const elapsed = now - this.lastCallTime;
-    if (elapsed < this.minIntervalMs) {
-      return null; // Skip this call, will try next tick
+    if (now - this.lastCallTime < this.minIntervalMs) {
+      return null;
     }
     this.lastCallTime = now;
 
     try {
-      const prompt = this.buildPrompt(ctx);
-
-      const response = await this.client.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 500,
-        messages: [{ role: 'user', content: prompt }],
+      const response = await this.client.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: 300,
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'user', content: buildUserPrompt(ctx) },
+        ],
       });
 
-      const text = response.content
-        .filter((block): block is Anthropic.TextBlock => block.type === 'text')
-        .map((block) => block.text)
-        .join('');
-
+      const text = response.choices[0]?.message?.content ?? '';
       const analysis = this.parseResponse(text);
+
       if (analysis) {
         this.cache.set(marketId, { analysis, timestamp: Date.now() });
         logger.info(
@@ -139,44 +125,18 @@ export class ClaudeAnalyzer {
             edge: analysis.edge,
             reasoning: analysis.reasoning,
           },
-          'Claude analysis complete',
+          'AI analysis complete',
         );
       }
       return analysis;
     } catch (err: any) {
-      logger.error({ error: err.message, marketId }, 'Claude analysis failed');
+      logger.error({ error: err.message, marketId }, 'AI analysis failed');
       return null;
     }
   }
 
-  private buildPrompt(ctx: MarketContext): string {
-    const priceHistoryStr = ctx.priceHistory
-      .slice(-10)
-      .map((p) => p.toFixed(4))
-      .join(', ');
-
-    return ANALYSIS_PROMPT
-      .replace('{question}', ctx.question)
-      .replace('{yesPrice}', `$${ctx.currentYesPrice.toFixed(2)}`)
-      .replace('{noPrice}', `$${ctx.currentNoPrice.toFixed(2)}`)
-      .replace('{spread}', ctx.spread.toFixed(0))
-      .replace('{volume}', `$${ctx.volume24h.toLocaleString()}`)
-      .replace('{liquidity}', `$${ctx.liquidity.toLocaleString()}`)
-      .replace('{dayChange}', (ctx.oneDayPriceChange ?? 0).toFixed(2))
-      .replace('{weekChange}', (ctx.oneWeekPriceChange ?? 0).toFixed(2))
-      .replace('{endDate}', ctx.endDate ?? 'unknown')
-      .replace('{priceHistory}', priceHistoryStr)
-      .replace('{momentum}', ctx.quantSignals.momentum)
-      .replace('{meanReversion}', ctx.quantSignals.meanReversion)
-      .replace('{volumeDivergence}', ctx.quantSignals.volumeDivergence)
-      .replace('{regime}', ctx.quantSignals.regime)
-      .replace('{acceleration}', ctx.quantSignals.acceleration)
-      .replace('{liquidityQuality}', ctx.quantSignals.liquidityQuality);
-  }
-
   private parseResponse(text: string): MarketAnalysis | null {
     try {
-      // Try to extract JSON from the response
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) return null;
 
@@ -194,7 +154,7 @@ export class ClaudeAnalyzer {
         factors: Array.isArray(parsed.factors) ? parsed.factors.map(String) : [],
       };
     } catch {
-      logger.warn({ text: text.slice(0, 200) }, 'Failed to parse Claude response');
+      logger.warn({ text: text.slice(0, 200) }, 'Failed to parse AI response');
       return null;
     }
   }

@@ -464,9 +464,9 @@ export class AiForecastStrategy extends BaseStrategy {
 
         const regimeMult = regime === 'trending' ? 1.0 : regime === 'ranging' ? 0.7 : 0.5;
 
-        const maxFromCapital = capital * Math.min(kellyFrac * regimeMult, 0.03);
-        const maxFromLiquidity = liquidity * 0.003;
-        const size = Math.max(1, Math.floor(Math.min(maxFromCapital, maxFromLiquidity, 40)));
+        const maxFromCapital = capital * Math.min(kellyFrac * regimeMult, 0.015); // 1.5% max per trade (was 3%)
+        const maxFromLiquidity = liquidity * 0.002;
+        const size = Math.max(1, Math.floor(Math.min(maxFromCapital, maxFromLiquidity, 20))); // max 20 shares (was 40)
 
         const price =
           signal.side === 'BUY'
@@ -532,8 +532,8 @@ export class AiForecastStrategy extends BaseStrategy {
 
       let exitReason: string | undefined;
 
-      // Partial profit: take 50% at +100 bps
-      if (!pos.partialTaken && edgeBps >= 100) {
+      // Partial profit: take 50% at +50 bps (lock in gains early)
+      if (!pos.partialTaken && edgeBps >= 50) {
         const partialSize = Math.floor(pos.originalSize * 0.5);
         pos.size = pos.size - partialSize;
         pos.partialTaken = true;
@@ -550,25 +550,25 @@ export class AiForecastStrategy extends BaseStrategy {
         continue;
       }
 
-      // Trailing stop: activates at +60 bps, trails 40 bps
-      if (pos.peakBps > 60 && edgeBps < pos.peakBps - 40) {
+      // Trailing stop: activates at +30 bps, trails 20 bps (protect small gains)
+      if (pos.peakBps > 30 && edgeBps < pos.peakBps - 20) {
         exitReason = 'TRAILING_STOP';
       }
 
-      // Take profit: +150 bps
-      if (!exitReason && edgeBps >= 150) {
+      // Take profit: +80 bps (take profit faster, don't hold for huge moves)
+      if (!exitReason && edgeBps >= 80) {
         exitReason = 'TAKE_PROFIT';
       }
 
-      // Stop-loss: -120 bps (wider in volatile regime)
-      const stopBps = pos.regime === 'volatile' ? -150 : -120;
+      // Stop-loss: -50 bps (tight! losses must be smaller than wins)
+      const stopBps = pos.regime === 'volatile' ? -40 : -50;
       if (!exitReason && edgeBps <= stopBps) {
         exitReason = 'STOP_LOSS';
       }
 
-      // Time exit: regime-dependent
+      // Time exit: shorter holds, cut losers faster
       const maxHoldMin =
-        pos.regime === 'trending' ? 60 : pos.regime === 'ranging' ? 30 : 20;
+        pos.regime === 'trending' ? 30 : pos.regime === 'ranging' ? 15 : 10;
       if (!exitReason && holdingMin > maxHoldMin) {
         exitReason = 'TIME_EXIT';
       }
