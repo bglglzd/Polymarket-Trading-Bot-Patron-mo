@@ -16,6 +16,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@ethersproject/wallet": "^5.8.0",
+    "@polymarket/clob-client": "^5.8.0",
     "better-sqlite3": "^12.6.2",
     "commander": "^12.1.0",
     "pino": "^9.3.2",
