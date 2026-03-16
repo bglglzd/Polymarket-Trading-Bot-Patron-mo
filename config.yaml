@@ -8,12 +8,12 @@ wallets:
   - id: patron_main
     mode: PAPER
     strategy: ai_forecast
-    capital: 1000
+    capital: 100
     risk_limits:
-      max_position_size: 100
-      max_exposure_per_market: 200
-      max_daily_loss: 50
-      max_open_trades: 15
+      max_position_size: 20
+      max_exposure_per_market: 30
+      max_daily_loss: 10
+      max_open_trades: 10
       max_drawdown: 0.10
 
 strategy_config:
