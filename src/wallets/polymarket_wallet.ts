@@ -259,9 +259,8 @@ export class PolymarketWallet {
               );
             }
           } else {
-            // Sell without matching buy — count proceeds as PnL
-            tradePnl = cost;
-            this.state.realizedPnl += tradePnl;
+            // Sell without matching buy — cost basis unknown, skip PnL
+            tradePnl = 0;
           }
         }
 
