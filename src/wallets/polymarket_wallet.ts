@@ -421,51 +421,35 @@ export class PolymarketWallet {
       // Real PnL = (current value of everything) - initial deposit
       this.state.realizedPnl = usdcBalance + positionCost - this.initialDeposit;
 
-      // Recompute per-trade PnL proportionally so win/loss stats make sense
-      // We know total real PnL; distribute it across resolution trades
+      // Recompute per-trade PnL for resolution trades using cost basis
       const resolutionTrades = this.trades.filter((t) =>
         t.orderId.startsWith('resolution-'),
       );
-      if (resolutionTrades.length > 0) {
-        // Reset all trade PnL first
-        for (const t of this.trades) {
-          t.realizedPnl = 0;
-        }
-        // For resolution trades: WIN gets positive PnL, LOSS gets negative
-        // Use actual cost basis: win = (payout - cost), loss = (-cost)
-        let runningPnl = 0;
-        for (const t of resolutionTrades) {
-          if (t.price === 1) {
-            // WIN: received shares * $1 minus what we paid
-            // Find the original buy cost from the position's avgPrice
-            const buyTrades = this.trades.filter(
-              (b) =>
-                b.marketId === t.marketId &&
-                b.outcome === t.outcome &&
-                b.side === 'BUY',
-            );
-            const totalBuySpent = buyTrades.reduce((s, b) => s + b.cost, 0);
-            // Approximate per-resolution PnL: payout - cost (before fees)
-            t.realizedPnl = t.cost - totalBuySpent;
-          } else {
-            // LOSS: lost everything we paid
-            const buyTrades = this.trades.filter(
-              (b) =>
-                b.marketId === t.marketId &&
-                b.outcome === t.outcome &&
-                b.side === 'BUY',
-            );
-            const totalBuySpent = buyTrades.reduce((s, b) => s + b.cost, 0);
-            t.realizedPnl = -totalBuySpent;
-          }
-          runningPnl += t.realizedPnl;
-          t.cumulativePnl = runningPnl;
-        }
+      for (const t of resolutionTrades) {
+        const buyTrades = this.trades.filter(
+          (b) =>
+            b.marketId === t.marketId &&
+            b.outcome === t.outcome &&
+            b.side === 'BUY',
+        );
+        const totalBuySpent = buyTrades.reduce((s, b) => s + b.cost, 0);
+        t.realizedPnl = t.price === 1
+          ? t.cost - totalBuySpent  // WIN: payout - cost
+          : -totalBuySpent;          // LOSS: lost everything
       }
 
-      // Update balanceAfter on all trades
+      // Recompute cumulative PnL and running balance for all trades
+      let cumPnl = 0;
+      let runBalance = this.initialDeposit;
       for (const t of this.trades) {
-        t.balanceAfter = usdcBalance;
+        if (t.side === 'BUY') {
+          runBalance -= t.cost;
+        } else {
+          runBalance += t.cost;
+        }
+        cumPnl += t.realizedPnl;
+        t.cumulativePnl = cumPnl;
+        t.balanceAfter = Math.max(0, runBalance);
       }
 
       // Sort trades by timestamp (resolutions may have been appended at end)

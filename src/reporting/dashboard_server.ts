@@ -712,6 +712,10 @@ export class DashboardServer {
     if (this.engine) {
       for (const m of this.engine.getStream().getAllMarkets()) {
         prices.set(m.marketId, m.midPrice);
+        // Also index by conditionId (hex) so positions using CLOB IDs get prices
+        if (m.conditionId) {
+          prices.set(m.conditionId, m.midPrice);
+        }
       }
     }
     return prices;
