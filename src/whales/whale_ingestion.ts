@@ -272,7 +272,8 @@ export class WhaleIngestion {
     after?: string,
     limit = 100,
   ): Promise<ClobTrade[]> {
-    let url = `${this.clobApi}/trades?maker_address=${address}&limit=${limit}`;
+    // Use data-api (public, no auth) instead of CLOB (requires API key)
+    let url = `https://data-api.polymarket.com/trades?maker_address=${address}&limit=${limit}`;
     if (after) url += `&after=${encodeURIComponent(after)}`;
 
     this.recordRequest();
@@ -363,7 +364,7 @@ export class WhaleIngestion {
           continue;
         }
         // 4xx (non-429) — don't retry
-        logger.error({ status: res.status, url: url.replace(/maker_address=0x[a-fA-F0-9]+/, 'maker_address=REDACTED') }, 'CLOB request failed');
+        logger.debug({ status: res.status, url: url.replace(/maker_address=0x[a-fA-F0-9]+/, 'maker_address=REDACTED') }, 'API request failed');
         return null;
       } catch (err) {
         if (attempt === maxRetries) {
