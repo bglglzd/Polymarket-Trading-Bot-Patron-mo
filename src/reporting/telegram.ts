@@ -31,16 +31,26 @@ export class TelegramNotifier {
 
   /* ── Public API ──────────────────────────────────────────────── */
 
-  /** Send a startup notification */
+  /** Send a startup notification with full budget info */
   async notifyStartup(runnerCount: number, wallets: WalletState[]): Promise<void> {
     const totalCapital = wallets.reduce((s, w) => s + w.capitalAllocated, 0);
+    const totalBalance = wallets.reduce((s, w) => s + w.availableBalance, 0);
     const totalPositions = wallets.reduce((s, w) => s + w.openPositions.length, 0);
+    const totalPnl = wallets.reduce((s, w) => s + w.realizedPnl, 0);
+    const posValue = wallets.reduce(
+      (s, w) => s + w.openPositions.reduce((ps, p) => ps + p.size * p.avgPrice, 0),
+      0,
+    );
+    const pnlSign = totalPnl >= 0 ? '+' : '';
     const lines = [
       '🟢 *Bot Started*',
-      `Runners: ${runnerCount}`,
-      `Capital: $${totalCapital.toFixed(2)}`,
-      `Open positions: ${totalPositions}`,
-      `Mode: ${wallets.map((w) => w.mode).join(', ')}`,
+      '',
+      `💰 Total: *$${totalCapital.toFixed(2)}*`,
+      `   USDC: $${totalBalance.toFixed(2)}`,
+      `   Positions: ${totalPositions} (~$${posValue.toFixed(2)})`,
+      `   PnL: ${pnlSign}$${totalPnl.toFixed(2)}`,
+      '',
+      `Runners: ${runnerCount} | ${wallets.map((w) => w.mode).join(', ')}`,
     ];
     await this.send(lines.join('\n'));
   }
@@ -76,18 +86,42 @@ export class TelegramNotifier {
     await this.send(lines.join('\n'));
   }
 
-  /** Periodic summary (call from engine tick) */
+  /** Periodic summary with full budget breakdown */
   async notifySummary(wallets: WalletState[]): Promise<void> {
-    const lines = ['📊 *Status Update*'];
+    const totalCapital = wallets.reduce((s, w) => s + w.capitalAllocated, 0);
+    const totalBalance = wallets.reduce((s, w) => s + w.availableBalance, 0);
+    const totalPnl = wallets.reduce((s, w) => s + w.realizedPnl, 0);
+    const pnlSign = totalPnl >= 0 ? '+' : '';
+    const lines = ['📊 *Status Update*', ''];
+
     for (const w of wallets) {
       const posValue = w.openPositions.reduce((s, p) => s + p.size * p.avgPrice, 0);
+      const wPnlSign = w.realizedPnl >= 0 ? '+' : '';
       lines.push(
         `*${w.walletId}* (${w.mode})`,
-        `  Balance: $${w.availableBalance.toFixed(2)}`,
-        `  Positions: ${w.openPositions.length} (~$${posValue.toFixed(2)})`,
-        `  PnL: ${w.realizedPnl >= 0 ? '+' : ''}$${w.realizedPnl.toFixed(2)}`,
+        `💰 Total: *$${w.capitalAllocated.toFixed(2)}*`,
+        `   USDC: $${w.availableBalance.toFixed(2)}`,
+        `   Positions: ${w.openPositions.length} (~$${posValue.toFixed(2)})`,
+        `   PnL: ${wPnlSign}$${w.realizedPnl.toFixed(2)}`,
       );
+
+      // Top 5 positions by value
+      if (w.openPositions.length > 0) {
+        const sorted = [...w.openPositions]
+          .sort((a, b) => (b.size * b.avgPrice) - (a.size * a.avgPrice))
+          .slice(0, 5);
+        lines.push('');
+        for (const p of sorted) {
+          const val = p.size * p.avgPrice;
+          lines.push(`   ${p.outcome} x${p.size.toFixed(0)} @ $${p.avgPrice.toFixed(2)} = $${val.toFixed(2)}`);
+        }
+      }
     }
+
+    if (wallets.length > 1) {
+      lines.push('', `*Overall:* $${totalCapital.toFixed(2)} | USDC: $${totalBalance.toFixed(2)} | PnL: ${pnlSign}$${totalPnl.toFixed(2)}`);
+    }
+
     await this.send(lines.join('\n'));
   }
 

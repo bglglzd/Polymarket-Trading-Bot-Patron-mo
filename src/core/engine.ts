@@ -73,12 +73,26 @@ export class Engine {
       strategies: [...new Set(this.runners.map((r) => r.strategy.name))],
     });
 
-    // Telegram: startup notification
-    const walletStates = this.runners.map((r) => {
-      const w = this.walletManager.getWallet(r.walletId);
-      return w ? w.getState() : null;
-    }).filter((s): s is NonNullable<typeof s> => s !== null);
-    telegram.notifyStartup(this.runners.length, walletStates).catch(() => {});
+    // Telegram: startup notification — delayed until first sync completes
+    const sendStartup = async () => {
+      // Wait up to 90s for the first wallet sync to complete
+      for (let i = 0; i < 30; i++) {
+        const allSynced = this.runners.every((r) => {
+          const w = this.walletManager.getWallet(r.walletId);
+          return w && typeof (w as any).firstSyncDone !== 'undefined'
+            ? (w as any).firstSyncDone
+            : true;
+        });
+        if (allSynced) break;
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+      const states = this.runners.map((r) => {
+        const w = this.walletManager.getWallet(r.walletId);
+        return w ? w.getState() : null;
+      }).filter((s): s is NonNullable<typeof s> => s !== null);
+      telegram.notifyStartup(this.runners.length, states).catch(() => {});
+    };
+    sendStartup().catch(() => {});
 
     // Telegram: periodic summary every 4 hours
     this.summaryInterval = setInterval(() => {
