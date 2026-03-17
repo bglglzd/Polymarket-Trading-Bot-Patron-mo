@@ -2,6 +2,7 @@ import { ClobClient, Side, OrderType, AssetType, SignatureType } from '@polymark
 import { Wallet } from '@ethersproject/wallet';
 import { WalletConfig, WalletState, TradeRecord, Position } from '../types';
 import { logger } from '../reporting/logs';
+import { PositionRedeemer } from './redeemer';
 
 export class PolymarketWallet {
   private state: WalletState;
@@ -11,6 +12,10 @@ export class PolymarketWallet {
   private displayName = '';
   private syncedTradeIds = new Set<string>();
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private redeemer: PositionRedeemer | null = null;
+  private redeemTimer: ReturnType<typeof setInterval> | null = null;
+  /** Flag set after first sync completes — used by Telegram startup */
+  firstSyncDone = false;
   /** Condition IDs we already checked for resolution (avoid repeat API calls) */
   private resolvedMarkets = new Map<string, { won: boolean; payout: number }>();
   /** Map position key (market|outcome) → CLOB asset_id (token ID) for resolution checks */
@@ -98,11 +103,42 @@ export class PolymarketWallet {
 
       // Sync existing trades from CLOB on startup
       await this.syncTradesFromClob();
+      this.firstSyncDone = true;
 
       // Periodically sync trades every 60s
       this.syncTimer = setInterval(() => this.syncTradesFromClob(), 60_000);
+
+      // Auto-claim: initialize redeemer and scan every 5 minutes
+      const proxyAddr = process.env.POLYMARKET_PROXY_ADDRESS;
+      const pk = process.env.PK_PRIVATE_KEY;
+      if (pk && proxyAddr) {
+        this.redeemer = new PositionRedeemer(pk, proxyAddr);
+        // First scan after 30s (let trade sync settle)
+        setTimeout(() => this.runRedeemScan(), 30_000);
+        this.redeemTimer = setInterval(() => this.runRedeemScan(), 5 * 60_000);
+      }
     } catch (err: any) {
       logger.error({ error: err.message }, 'Failed to initialize Polymarket CLOB client');
+    }
+  }
+
+  /** Scan for redeemable positions and auto-claim them */
+  private async runRedeemScan(): Promise<void> {
+    if (!this.redeemer) return;
+    try {
+      const results = await this.redeemer.scanAndRedeemAll();
+      const claimed = results.filter((r) => r.success);
+      if (claimed.length > 0) {
+        const totalClaimed = claimed.reduce((s, r) => s + (r.usdcRedeemed ?? 0), 0);
+        logger.info(
+          { claimed: claimed.length, totalUSDC: totalClaimed.toFixed(2) },
+          'Auto-claimed winning positions',
+        );
+        // Re-sync after claim to update balances
+        await this.syncTradesFromClob();
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Redeem scan failed');
     }
   }
 
