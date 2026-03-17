@@ -21,13 +21,13 @@ wallets:
   - id: patron_live
     mode: LIVE
     strategy: ai_forecast
-    capital: 100
+    capital: 99.36
     risk_limits:
-      max_position_size: 10
+      max_position_size: 25
       max_exposure_per_market: 20
-      max_daily_loss: 5
-      max_open_trades: 5
-      max_drawdown: 0.05
+      max_daily_loss: 15        # cumulative PnL limit (includes past losses from spam bug)
+      max_open_trades: 15        # room for ~5 legacy + 5 new positions
+      max_drawdown: 0.15        # 15% drawdown limit from starting capital
 
 strategy_config:
   ai_forecast:

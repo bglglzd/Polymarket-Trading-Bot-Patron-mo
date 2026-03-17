@@ -27,6 +27,8 @@ interface GammaMarket {
     slug?: string;
     series?: Array<{ slug?: string }>;
   }>;
+  /** Hex condition ID – matches CLOB trade `market` field */
+  conditionId?: string;
 }
 
 export class MarketFetcher {
@@ -147,6 +149,7 @@ export class MarketFetcher {
           seriesSlug: m.events?.[0]?.series?.[0]?.slug ?? undefined,
           oneDayPriceChange: m.oneDayPriceChange ?? undefined,
           oneWeekPriceChange: m.oneWeekPriceChange ?? undefined,
+          conditionId: m.conditionId ?? undefined,
         });
       } catch {
         logger.warn({ marketId: m.id }, 'Skipping unparseable market');

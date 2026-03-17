@@ -8,6 +8,8 @@ export interface StrategyContext {
 export interface StrategyInterface {
   readonly name: string;
   initialize(context: StrategyContext): Promise<void> | void;
+  /** Refresh wallet state so strategy sees live positions/balances */
+  updateWalletState(wallet: import('../types').WalletState): void;
   onMarketUpdate(data: MarketData): Promise<void> | void;
   onTimer(): Promise<void> | void;
   generateSignals(): Promise<Signal[]> | Signal[];
@@ -41,6 +43,12 @@ export abstract class BaseStrategy implements StrategyInterface {
 
   initialize(context: StrategyContext): void {
     this.context = context;
+  }
+
+  updateWalletState(wallet: import('../types').WalletState): void {
+    if (this.context) {
+      this.context.wallet = wallet;
+    }
   }
 
   onMarketUpdate(data: MarketData): void {

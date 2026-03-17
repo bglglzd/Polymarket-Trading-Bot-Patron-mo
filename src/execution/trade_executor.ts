@@ -5,6 +5,7 @@ export class TradeExecutor {
   async execute(order: OrderRequest, wallet: ExecutionWallet): Promise<void> {
     await wallet.placeOrder({
       marketId: order.marketId,
+      tokenId: order.tokenId,
       outcome: order.outcome,
       side: order.side,
       price: order.price,

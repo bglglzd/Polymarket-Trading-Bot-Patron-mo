@@ -42,6 +42,8 @@ export type OrderOutcome = 'YES' | 'NO';
 export interface OrderRequest {
   walletId: string;
   marketId: string;
+  /** CLOB token ID for the specific outcome (YES/NO). Required for live trading. */
+  tokenId?: string;
   outcome: OrderOutcome;
   side: OrderSide;
   price: number;
@@ -85,6 +87,8 @@ export interface MarketData {
   oneDayPriceChange?: number;
   /** 1-week price change reported by Gamma */
   oneWeekPriceChange?: number;
+  /** Hex condition ID from Gamma — matches CLOB trade `market` field */
+  conditionId?: string;
 }
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
