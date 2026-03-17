@@ -7,6 +7,7 @@ import { STRATEGY_REGISTRY } from '../strategies/registry';
 import { AppConfig, MarketData } from '../types';
 import { logger } from '../reporting/logs';
 import { consoleLog } from '../reporting/console_log';
+import { telegram } from '../reporting/telegram';
 
 interface StrategyRunner {
   strategy: StrategyInterface;
@@ -19,6 +20,7 @@ export class Engine {
   private readonly stream: OrderbookStream;
   private readonly runners: StrategyRunner[] = [];
   private readonly pausedWallets = new Set<string>();
+  private summaryInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly config: AppConfig,
@@ -70,13 +72,31 @@ export class Engine {
       runners: this.runners.length,
       strategies: [...new Set(this.runners.map((r) => r.strategy.name))],
     });
+
+    // Telegram: startup notification
+    const walletStates = this.runners.map((r) => {
+      const w = this.walletManager.getWallet(r.walletId);
+      return w ? w.getState() : null;
+    }).filter((s): s is NonNullable<typeof s> => s !== null);
+    telegram.notifyStartup(this.runners.length, walletStates).catch(() => {});
+
+    // Telegram: periodic summary every 4 hours
+    this.summaryInterval = setInterval(() => {
+      const states = this.runners.map((r) => {
+        const w = this.walletManager.getWallet(r.walletId);
+        return w ? w.getState() : null;
+      }).filter((s): s is NonNullable<typeof s> => s !== null);
+      telegram.notifySummary(states).catch(() => {});
+    }, 4 * 60 * 60 * 1000);
   }
 
   stop(): void {
     this.scheduler.stop();
     this.stream.stop();
+    if (this.summaryInterval) clearInterval(this.summaryInterval);
     logger.info('Engine stopped');
     consoleLog.warn('ENGINE', 'Engine stopped');
+    telegram.sendText('🔴 *Bot Stopped*').catch(() => {});
   }
 
   /** Expose the stream so the dashboard can query live market data */
@@ -213,6 +233,11 @@ export class Engine {
 
     for (const runner of this.runners) {
       if (this.pausedWallets.has(runner.walletId)) continue;  // skip paused
+      // Refresh wallet state so strategy sees live positions/balances
+      const wallet = this.walletManager.getWallet(runner.walletId);
+      if (wallet) {
+        runner.strategy.updateWalletState(wallet.getState());
+      }
       runner.strategy.onTimer();
       await this.processSignals(runner);
     }
@@ -282,6 +307,9 @@ export class Engine {
             size: order.size,
             cost: Number((order.price * order.size).toFixed(4)),
           });
+          // Telegram notification
+          const question = this.stream.getMarket(order.marketId)?.question;
+          telegram.notifyTrade(order, question).catch(() => {});
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -324,6 +352,9 @@ export class Engine {
             price: exitOrder.price,
             size: exitOrder.size,
           });
+          // Telegram exit notification
+          const question = this.stream.getMarket(exitOrder.marketId)?.question;
+          telegram.notifyExit(exitOrder, undefined, question).catch(() => {});
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

@@ -1140,6 +1140,7 @@ export class DashboardServer {
         walletName: string;
         strategy: string;
         marketId: string;
+        marketName: string;
         outcome: string;
         side: string;
         price: number;
@@ -1152,6 +1153,7 @@ export class DashboardServer {
       }> = [];
       for (const [walletId, trades] of allTradesMap) {
         const ws = wallets.find((w) => w.walletId === walletId);
+        const wallet = this.walletManager.getWallet(walletId);
         const walletName =
           this.walletDisplayNames.get(walletId) ?? ws?.assignedStrategy ?? walletId;
         const strategy = ws?.assignedStrategy ?? 'unknown';
@@ -1162,6 +1164,7 @@ export class DashboardServer {
             walletName,
             strategy,
             marketId: t.marketId,
+            marketName: wallet?.getMarketName?.(t.marketId) ?? '',
             outcome: t.outcome,
             side: t.side,
             price: t.price,
@@ -4401,7 +4404,7 @@ document.querySelectorAll('.con-sub-tab').forEach(btn=>{
       '<td style="color:var(--muted)">'+idx+'</td>'+
       '<td><div style="font-size:12px">'+time+'</div><div style="font-size:10px;color:var(--muted)">'+date+'</div></td>'+
       '<td><span class="tl-wallet-tag" title="'+escHtml(t.walletId)+'">'+escHtml(t.walletName)+'</span></td>'+
-      '<td><span class="tl-market-id" title="'+escHtml(t.marketId)+'">'+escHtml(t.marketId.length>24?t.marketId.slice(0,10)+'…'+t.marketId.slice(-10):t.marketId)+'</span></td>'+
+      '<td><span class="tl-market-id" title="'+escHtml(t.marketId)+'">'+(t.marketName?escHtml(t.marketName.length>40?t.marketName.slice(0,40)+'…':t.marketName):escHtml(t.marketId.length>24?t.marketId.slice(0,10)+'…'+t.marketId.slice(-10):t.marketId))+'</span></td>'+
       '<td><span class="'+sideBadge+'">'+t.side+'</span></td>'+
       '<td><span class="o-'+t.outcome+'">'+t.outcome+'</span></td>'+
       '<td>$'+tlFmt(t.price,4)+'</td>'+
@@ -4434,8 +4437,9 @@ document.querySelectorAll('.con-sub-tab').forEach(btn=>{
     tbody.innerHTML=rows;
     showingEl.textContent='Showing '+display.length+(filtered.length>MAX_DISPLAY?' of '+filtered.length:'')+' trades';
 
-    if(autoScroll.checked){
-      tableWrap.scrollTop=0; // newest is at top
+    if(autoScroll.checked && lastTradeCount!==display.length){
+      tableWrap.scrollTop=0; // newest is at top, only on new trades
+      lastTradeCount=display.length;
     }
   }
 
@@ -4460,13 +4464,21 @@ document.querySelectorAll('.con-sub-tab').forEach(btn=>{
     }
   }
 
+  let lastTradeCount=0;
+  let lastTradeHash='';
   async function fetchTrades(){
     try{
       const r=await fetch('/api/trades/all');
       if(!r.ok) return;
       const d=await r.json();
-      allTrades=d.trades||[];
-      summary=d.summary||{totalTrades:0,totalRealizedPnl:0,winCount:0,lossCount:0,totalVolume:0};
+      const newTrades=d.trades||[];
+      const newSummary=d.summary||{totalTrades:0,totalRealizedPnl:0,winCount:0,lossCount:0,totalVolume:0};
+      // Only re-render if data actually changed (avoids scroll reset)
+      const hash=newTrades.length+':'+newSummary.totalRealizedPnl;
+      if(hash===lastTradeHash){return;}
+      lastTradeHash=hash;
+      allTrades=newTrades;
+      summary=newSummary;
       updateWalletFilter();
       updateSummary();
       renderAll();

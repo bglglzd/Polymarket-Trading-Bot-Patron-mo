@@ -8,6 +8,7 @@ export interface ExecutionWallet {
   getTradeHistory(): TradeRecord[];
   placeOrder(request: {
     marketId: string;
+    tokenId?: string;
     outcome: 'YES' | 'NO';
     side: 'BUY' | 'SELL';
     price: number;
@@ -19,6 +20,8 @@ export interface ExecutionWallet {
   setDisplayName?(name: string): void;
   /** Update risk limits at runtime */
   updateRiskLimits?(limits: Partial<import('../types').RiskLimits>): void;
+  /** Get cached market name for a condition ID */
+  getMarketName?(conditionId: string): string | undefined;
 }
 
 export class WalletManager {

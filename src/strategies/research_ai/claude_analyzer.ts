@@ -1,7 +1,7 @@
-import { execFile, exec } from 'child_process';
-import { writeFileSync, readFileSync, unlinkSync } from 'fs';
-import { tmpdir } from 'os';
+import { execFile, exec, spawn } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { tmpdir } from 'os';
 import { logger } from '../../reporting/logs';
 
 export interface MarketAnalysis {
@@ -49,30 +49,26 @@ End: ${ctx.endDate ?? 'unknown'}
 Prices: [${priceHistoryStr}]
 Signals: momentum=${ctx.quantSignals.momentum} mean_rev=${ctx.quantSignals.meanReversion} vol_div=${ctx.quantSignals.volumeDivergence} regime=${ctx.quantSignals.regime} accel=${ctx.quantSignals.acceleration} liq=${ctx.quantSignals.liquidityQuality}
 
-Rules: SKIP if uncertain/50-50/conflicting signals. Be conservative.
+Rules: SKIP only if truly 50-50 with no informational edge. If you have a directional lean, give YES or NO with your honest confidence. We profit from price movement, not just resolution. Look for mispricing based on real-world knowledge.
 Respond ONLY: {"direction":"YES"|"NO"|"SKIP","confidence":0.0-1.0,"edge":0.0-0.10,"reasoning":"1-2 sentences","factors":["f1","f2"]}`;
 }
 
-function runCodex(prompt: string, timeoutMs: number): Promise<string> {
+function runClaude(prompt: string, timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    const outFile = join(tmpdir(), `codex-out-${Date.now()}.txt`);
+    // Write prompt to temp file and pipe to claude via stdin
+    // This avoids shell escaping issues with $ signs in market data
+    const tmpFile = join(tmpdir(), `claude-prompt-${Date.now()}.txt`);
+    writeFileSync(tmpFile, prompt);
 
-    // Use 'codex exec' for non-interactive mode with output file
-    const child = exec(
-      `codex exec -o ${outFile} --skip-git-repo-check --ephemeral -- ${JSON.stringify(prompt)}`,
+    exec(
+      `cat ${tmpFile} | claude -p - --output-format text`,
       { timeout: timeoutMs, maxBuffer: 1024 * 1024, cwd: '/tmp' },
       (error, stdout, stderr) => {
-        let output = '';
-        try {
-          output = readFileSync(outFile, 'utf-8').trim();
-          unlinkSync(outFile);
-        } catch {
-          // Output file not created, use stdout
-          output = stdout.trim();
-        }
+        try { unlinkSync(tmpFile); } catch {}
+        const output = stdout.trim();
 
         if (error && !output) {
-          reject(new Error(`codex failed: ${error.message}`));
+          reject(new Error(`claude failed: ${error.message}${stderr ? ' | stderr: ' + stderr.slice(0, 200) : ''}`));
           return;
         }
         resolve(output);
@@ -84,19 +80,21 @@ function runCodex(prompt: string, timeoutMs: number): Promise<string> {
 export class ClaudeAnalyzer {
   private enabled = false;
   private lastCallTime = 0;
-  private minIntervalMs = 10_000; // 10s between calls (CLI is slower)
+  private minIntervalMs = 10_000; // 10s between calls
+  private consecutiveFailures = 0;
+  private maxConsecutiveFailures = 5; // disable after 5 failures in a row
   private cache = new Map<string, { analysis: MarketAnalysis; timestamp: number }>();
-  private cacheTtlMs = 600_000; // 10 min cache (CLI calls are expensive)
-  private callTimeoutMs = 60_000; // 60s timeout per call (codex exec is slow)
+  private cacheTtlMs = 600_000; // 10 min cache
+  private callTimeoutMs = 45_000; // 45s timeout
 
   constructor() {
-    // Check if codex CLI is available
-    execFile('codex', ['--version'], { timeout: 5000 }, (error) => {
+    // Check if claude CLI is available
+    execFile('claude', ['--version'], { timeout: 5000 }, (error) => {
       if (error) {
-        logger.warn('Codex CLI not found — AI analysis disabled, using quant-only mode');
+        logger.warn('Claude CLI not found — AI analysis disabled, using quant-only mode');
         this.enabled = false;
       } else {
-        logger.info('AI Analyzer initialized (Codex CLI)');
+        logger.info('AI Analyzer initialized (Claude CLI)');
         this.enabled = true;
       }
     });
@@ -115,7 +113,7 @@ export class ClaudeAnalyzer {
       return cached.analysis;
     }
 
-    // Rate limiting (stricter for CLI)
+    // Rate limiting
     const now = Date.now();
     if (now - this.lastCallTime < this.minIntervalMs) {
       return null;
@@ -124,10 +122,11 @@ export class ClaudeAnalyzer {
 
     try {
       const prompt = buildPrompt(ctx);
-      const output = await runCodex(prompt, this.callTimeoutMs);
+      const output = await runClaude(prompt, this.callTimeoutMs);
       const analysis = this.parseResponse(output);
 
       if (analysis) {
+        this.consecutiveFailures = 0; // reset on success
         this.cache.set(marketId, { analysis, timestamp: Date.now() });
         logger.info(
           {
@@ -137,19 +136,33 @@ export class ClaudeAnalyzer {
             edge: analysis.edge,
             reasoning: analysis.reasoning,
           },
-          'AI analysis complete (Codex)',
+          'AI analysis complete (Claude)',
         );
       }
       return analysis;
     } catch (err: any) {
-      logger.error({ error: err.message, marketId }, 'Codex analysis failed');
+      this.consecutiveFailures++;
+      logger.error(
+        { error: err.message, marketId, failures: this.consecutiveFailures },
+        'Claude analysis failed',
+      );
+
+      // Disable after too many consecutive failures to stop wasting resources
+      if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+        logger.warn(
+          { failures: this.consecutiveFailures },
+          'Too many consecutive Claude failures — disabling AI analysis, quant-only mode',
+        );
+        this.enabled = false;
+      }
+
       return null;
     }
   }
 
   private parseResponse(text: string): MarketAnalysis | null {
     try {
-      // Extract JSON from response (codex may include extra text)
+      // Extract JSON from response (claude may include extra text)
       const jsonMatch = text.match(/\{[\s\S]*?\}/);
       if (!jsonMatch) return null;
 
@@ -162,12 +175,12 @@ export class ClaudeAnalyzer {
       return {
         direction: parsed.direction as 'YES' | 'NO' | 'SKIP',
         confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0)),
-        edge: Math.min(0.1, Math.max(0, Number(parsed.edge) || 0)),
+        edge: Math.min(0.15, Math.max(0, Number(parsed.edge) || 0)),
         reasoning: String(parsed.reasoning || ''),
         factors: Array.isArray(parsed.factors) ? parsed.factors.map(String) : [],
       };
     } catch {
-      logger.warn({ text: text.slice(0, 200) }, 'Failed to parse Codex response');
+      logger.warn({ text: text.slice(0, 200) }, 'Failed to parse Claude response');
       return null;
     }
   }
