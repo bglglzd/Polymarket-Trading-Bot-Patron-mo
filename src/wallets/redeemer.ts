@@ -54,6 +54,8 @@ export interface RedeemResult {
 export class PositionRedeemer {
   private readonly signer: Wallet;
   private readonly proxyWallet: string;
+  /** Track already-claimed condition IDs to avoid duplicate redemptions */
+  private readonly claimedIds = new Set<string>();
 
   constructor(privateKey: string, proxyWallet: string) {
     this.signer = new Wallet(privateKey);
@@ -76,11 +78,12 @@ export class PositionRedeemer {
       for (const pos of positions) {
         const val = pos.currentValue ?? 0;
         const redeemable = pos.redeemable ?? false;
-        if (val > 0 && redeemable && pos.conditionId) {
-          const existing = toRedeem.get(pos.conditionId);
-          toRedeem.set(pos.conditionId, {
+        const cid = pos.conditionId ?? '';
+        if (val > 0 && redeemable && cid && !this.claimedIds.has(cid)) {
+          const existing = toRedeem.get(cid);
+          toRedeem.set(cid, {
             value: (existing?.value ?? 0) + val,
-            name: pos.title ?? pos.conditionId.slice(0, 16),
+            name: pos.title ?? cid.slice(0, 16),
           });
         }
       }
@@ -110,6 +113,7 @@ export class PositionRedeemer {
         if (result.success) {
           result.usdcRedeemed = info.value;
           result.marketName = info.name;
+          this.claimedIds.add(conditionId);
           // Notify via Telegram
           telegram.sendText(
             `💰 *Claimed* $${info.value.toFixed(2)}\n${info.name}`,
