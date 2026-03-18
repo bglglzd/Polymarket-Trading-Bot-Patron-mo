@@ -146,6 +146,8 @@ export interface Position {
   size: number;
   avgPrice: number;
   realizedPnl: number;
+  /** Current market price from data API (used for unrealized PnL) */
+  curPrice?: number;
 }
 
 export interface WalletState {

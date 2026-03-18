@@ -85,16 +85,8 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   const cutoff = inceptionDate ? new Date(inceptionDate).getTime() : 0;
   const sorted = [...trades].filter((t) => t.timestamp >= cutoff).sort((a, b) => a.timestamp - b.timestamp);
 
-  /* ── Determine which markets have post-inception trades (for position filtering) ── */
-  const postInceptionMarkets = new Set(sorted.map((t) => t.marketId));
-
-  /* ── Filter open positions to only post-inception ── */
-  const filteredPositions = cutoff > 0
-    ? wallet.openPositions.filter((p) => postInceptionMarkets.has(p.marketId))
-    : wallet.openPositions;
-
-  /* ── Compute realized PnL from filtered trades only ── */
-  const filteredRealizedPnl = sorted.reduce((sum, t) => sum + t.realizedPnl, 0);
+  /* ── All open positions (no filtering — they all affect portfolio value) ── */
+  const allPositions = wallet.openPositions.filter((p) => p.size > 0);
 
   /* ── Basic stats ── */
   const totalTrades = sorted.length;
@@ -200,12 +192,17 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   const dailyLossUtilization = wallet.riskLimits.maxDailyLoss > 0 ? dailyLossUsed / wallet.riskLimits.maxDailyLoss : 0;
   const openTradeUtilization = wallet.riskLimits.maxOpenTrades > 0 ? wallet.openPositions.length / wallet.riskLimits.maxOpenTrades : 0;
 
-  /* ── Unrealized PnL from filtered positions only ── */
-  const filteredUnrealizedPnl = filteredPositions.reduce((sum, p) => {
-    const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-    return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
+  /* ── Ground-truth PnL from portfolio value (matches Polymarket) ── */
+  // Use data API curPrice (outcome-aware) over orderbook midPrice (YES-only)
+  const unrealizedPnl = allPositions.reduce((sum, p) => {
+    const cp = p.curPrice ?? marketPrices?.get(p.marketId) ?? p.avgPrice;
+    return sum + (p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
   }, 0);
-  const totalPnl = filteredRealizedPnl + filteredUnrealizedPnl;
+  const positionMarketValue = allPositions.reduce((sum, p) => {
+    return sum + (p.curPrice ?? marketPrices?.get(p.marketId) ?? p.avgPrice) * p.size;
+  }, 0);
+  const totalPnl = wallet.availableBalance + positionMarketValue - wallet.capitalAllocated;
+  const realizedPnl = totalPnl - unrealizedPnl;
 
   return {
     wallet: {
@@ -214,9 +211,9 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
       strategy: wallet.assignedStrategy,
       capitalAllocated: wallet.capitalAllocated,
       availableBalance: round(wallet.availableBalance),
-      realizedPnl: round(filteredRealizedPnl),
-      openPositions: filteredPositions.map((p) => {
-        const currentPrice = marketPrices?.get(p.marketId) ?? p.avgPrice;
+      realizedPnl: round(realizedPnl),
+      openPositions: allPositions.map((p) => {
+        const currentPrice = p.curPrice ?? marketPrices?.get(p.marketId) ?? p.avgPrice;
         const uPnl = p.size > 0 && p.avgPrice > 0 ? (currentPrice - p.avgPrice) * p.size : 0;
         return {
           marketId: p.marketId,
@@ -246,7 +243,7 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
       longestWinStreak,
       longestLossStreak,
       currentStreak,
-      unrealizedPnl: round(filteredUnrealizedPnl),
+      unrealizedPnl: round(unrealizedPnl),
       totalPnl: round(totalPnl),
       roi: round4(totalPnl / Math.max(1, wallet.capitalAllocated)),
     },

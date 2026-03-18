@@ -487,14 +487,16 @@ export class PolymarketWallet {
               if (!p.size || p.size < 0.001) continue;
               const outcome: 'YES' | 'NO' =
                 (p.outcome ?? '').toUpperCase() === 'YES' ? 'YES' : 'NO';
+              const curPrice = p.curPrice ?? p.avgPrice ?? 0;
               this.state.openPositions.push({
                 marketId: p.conditionId ?? p.market ?? '',
                 outcome,
                 size: p.size,
                 avgPrice: p.avgPrice ?? 0,
                 realizedPnl: 0,
+                curPrice,
               });
-              realPositionValue += p.currentValue ?? (p.curPrice ?? p.avgPrice ?? 0) * p.size;
+              realPositionValue += p.currentValue ?? curPrice * p.size;
             }
           }
         } catch {
@@ -511,28 +513,11 @@ export class PolymarketWallet {
           );
 
       this.state.availableBalance = usdcBalance;
-      // Capital = money in positions + available cash
-      this.state.capitalAllocated = positionCost + usdcBalance;
+      // Capital = initial deposit (constant for ROI calculation)
+      this.state.capitalAllocated = this.initialDeposit;
 
-      // Real PnL = (current value of everything) - initial deposit
-      this.state.realizedPnl = usdcBalance + positionCost - this.initialDeposit;
-
-      // Recompute per-trade PnL for resolution trades using cost basis
-      const resolutionTrades = this.trades.filter((t) =>
-        t.orderId.startsWith('resolution-'),
-      );
-      for (const t of resolutionTrades) {
-        const buyTrades = this.trades.filter(
-          (b) =>
-            b.marketId === t.marketId &&
-            b.outcome === t.outcome &&
-            b.side === 'BUY',
-        );
-        const totalBuySpent = buyTrades.reduce((s, b) => s + b.cost, 0);
-        t.realizedPnl = t.price === 1
-          ? t.cost - totalBuySpent  // WIN: payout - cost
-          : -totalBuySpent;          // LOSS: lost everything
-      }
+      // realizedPnl was already accumulated correctly during trade processing
+      // (sells: line 366, resolutions: line 412) — do NOT overwrite it.
 
       // Recompute cumulative PnL and running balance for all trades
       let cumPnl = 0;

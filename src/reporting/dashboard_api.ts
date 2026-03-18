@@ -111,30 +111,19 @@ export function buildDashboardPayload(
   const entries: WalletDashboardEntry[] = wallets.map((w) => {
     const allTrades = tradesByWallet.get(w.walletId) ?? [];
 
-    // Apply inception date filter if configured
+    // Apply inception date filter for trade history/stats only
     const cutoff = inceptionDates?.get(w.walletId)
       ? new Date(inceptionDates.get(w.walletId)!).getTime()
       : 0;
     const trades = cutoff > 0 ? allTrades.filter((t) => t.timestamp >= cutoff) : allTrades;
 
-    // Identify markets that have post-inception trades (for position filtering)
-    const postInceptionMarkets = cutoff > 0
-      ? new Set(trades.map((t) => t.marketId))
-      : null;
-
-    // Compute filtered realized PnL from trades (not wallet state, which is unfiltered)
-    const filteredRealizedPnl = cutoff > 0
-      ? trades.reduce((s, t) => s + t.realizedPnl, 0)
-      : w.realizedPnl;
-
-    // Compute unrealized PnL for each open position (skip zero-size)
+    // Compute unrealized PnL from ALL positions (not filtered — they all affect portfolio value)
+    // Use data API curPrice (outcome-aware) over orderbook midPrice (YES-only)
     let walletUnrealizedPnl = 0;
     const positions = w.openPositions
       .filter((p) => p.size > 0)
-      .filter((p) => !postInceptionMarkets || postInceptionMarkets.has(p.marketId))
       .map((p) => {
-        // Use live market price if available, otherwise use avgPrice (no unrealized PnL)
-        const currentPrice = marketPrices?.get(p.marketId) ?? p.avgPrice;
+        const currentPrice = p.curPrice ?? marketPrices?.get(p.marketId) ?? p.avgPrice;
         const unrealizedPnl =
           p.size > 0 && p.avgPrice > 0
             ? (currentPrice - p.avgPrice) * p.size
@@ -150,6 +139,15 @@ export function buildDashboardPayload(
         };
       });
 
+    // Ground-truth total PnL: portfolio value - initial deposit (matches Polymarket)
+    const positionMarketValue = w.openPositions
+      .filter((p) => p.size > 0)
+      .reduce((s, p) => s + (p.curPrice ?? marketPrices?.get(p.marketId) ?? p.avgPrice) * p.size, 0);
+    const totalPortfolioValue = w.availableBalance + positionMarketValue;
+    const totalPnl = totalPortfolioValue - w.capitalAllocated;
+    // Realized = total - unrealized (ensures realized + unrealized = total exactly)
+    const realizedPnl = totalPnl - walletUnrealizedPnl;
+
     return {
       walletId: w.walletId,
       displayName: displayNames?.get(w.walletId) ?? w.walletId,
@@ -157,13 +155,13 @@ export function buildDashboardPayload(
       strategy: w.assignedStrategy,
       capitalAllocated: w.capitalAllocated,
       availableBalance: Number(w.availableBalance.toFixed(4)),
-      realizedPnl: Number(filteredRealizedPnl.toFixed(4)),
+      realizedPnl: Number(realizedPnl.toFixed(4)),
       unrealizedPnl: Number(walletUnrealizedPnl.toFixed(4)),
-      totalPnl: Number((filteredRealizedPnl + walletUnrealizedPnl).toFixed(4)),
+      totalPnl: Number(totalPnl.toFixed(4)),
       paused: pausedWallets?.has(w.walletId) ?? false,
       openPositions: positions,
       riskLimits: w.riskLimits,
-      performance: computePerformance(w, trades, walletUnrealizedPnl, filteredRealizedPnl),
+      performance: computePerformance(w, trades, walletUnrealizedPnl, realizedPnl),
     };
   });
 
