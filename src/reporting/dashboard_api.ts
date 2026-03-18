@@ -21,6 +21,7 @@ export interface WalletDashboardEntry {
   mode: 'LIVE' | 'PAPER';
   strategy: string;
   capitalAllocated: number;
+  portfolioValue: number;
   availableBalance: number;
   realizedPnl: number;
   unrealizedPnl: number;
@@ -154,6 +155,7 @@ export function buildDashboardPayload(
       mode: w.mode,
       strategy: w.assignedStrategy,
       capitalAllocated: w.capitalAllocated,
+      portfolioValue: Number(totalPortfolioValue.toFixed(4)),
       availableBalance: Number(w.availableBalance.toFixed(4)),
       realizedPnl: Number(realizedPnl.toFixed(4)),
       unrealizedPnl: Number(walletUnrealizedPnl.toFixed(4)),

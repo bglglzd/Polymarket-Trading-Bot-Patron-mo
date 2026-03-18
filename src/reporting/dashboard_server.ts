@@ -244,6 +244,7 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
       longestLossStreak,
       currentStreak,
       unrealizedPnl: round(unrealizedPnl),
+      positionMarketValue: round(positionMarketValue),
       totalPnl: round(totalPnl),
       roi: round4(totalPnl / Math.max(1, wallet.capitalAllocated)),
     },
@@ -2655,9 +2656,10 @@ function renderSummary(d){
   const rPnl = d.totalRealizedPnl || d.totalPnl || 0;
   const uPnl = d.totalUnrealizedPnl || 0;
   const tPnl = d.totalPnl || 0;
+  const totalPortfolio = (d.wallets||[]).reduce(function(s,w){return s+(w.portfolioValue||0)},0);
   $('#summary').innerHTML=
     '<div class="s-card"><div class="label">Active Wallets</div><div class="value">'+d.activeWallets+'</div></div>'+
-    '<div class="s-card"><div class="label">Total Capital</div><div class="value">$'+fmt(d.totalCapital,0)+'</div></div>'+
+    '<div class="s-card"><div class="label">Portfolio</div><div class="value">$'+fmt(totalPortfolio)+'</div></div>'+
     '<div class="s-card"><div class="label">Realized PnL</div><div class="value '+pnlCls(rPnl)+'">$'+fmt(rPnl)+'</div></div>'+
     '<div class="s-card"><div class="label">Unrealized PnL</div><div class="value '+pnlCls(uPnl)+'">$'+fmt(uPnl)+'</div></div>'+
     '<div class="s-card"><div class="label">Total PnL</div><div class="value '+pnlCls(tPnl)+'">$'+fmt(tPnl)+'</div></div>'+
@@ -2681,8 +2683,9 @@ function renderWallets(wl){
     return '<div class="w-card" style="cursor:pointer" onclick="openWalletDetail(\\''+w.walletId+'\\')" title="Click for detailed analytics">'+
       '<div class="w-hdr"><div class="w-left"><span class="w-id">'+dName+'</span><span class="w-strat">'+w.strategy+'</span></div><div style="display:flex;align-items:center;gap:8px"><button class="toggle-btn '+toggleCls+'" onclick="event.stopPropagation();toggleWallet(\\''+w.walletId+'\\','+isPaused+')" title="'+(isPaused?'Start':'Pause')+' this wallet"><span class="toggle-dot"></span>'+toggleLabel+'</button><span class="badge badge-'+w.mode+'">'+w.mode+'</span></div></div>'+
       '<div class="w-body"><div class="m-row">'+
-      '<div class="m-cell"><div class="m-label">Capital</div><div class="m-val">$'+fmt(w.capitalAllocated,0)+'</div></div>'+
+      '<div class="m-cell"><div class="m-label">Portfolio</div><div class="m-val">$'+fmt(w.portfolioValue,2)+'</div></div>'+
       '<div class="m-cell"><div class="m-label">Available</div><div class="m-val">$'+fmt(w.availableBalance,0)+'</div></div>'+
+      '<div class="m-cell"><div class="m-label">Deposit</div><div class="m-val" style="color:var(--muted)">$'+fmt(w.capitalAllocated,2)+'</div></div>'+
       '<div class="m-cell"><div class="m-label">Realized</div><div class="m-val '+pnlCls(p.realizedPnl)+'">$'+fmt(p.realizedPnl)+'</div></div>'+
       '<div class="m-cell"><div class="m-label">Unrealized</div><div class="m-val '+pnlCls(uPnl)+'">$'+fmt(uPnl)+'</div></div>'+
       '<div class="m-cell"><div class="m-label">Total PnL</div><div class="m-val '+pnlCls(tPnl)+'">$'+fmt(tPnl)+'</div></div>'+
@@ -2776,13 +2779,14 @@ function renderWalletDetail(d){
   };
 
   let html='';
+  const portfolioVal = w.availableBalance + (d.stats?.positionMarketValue ?? 0);
 
   /* ── Status bar ── */
   const stCls = isPaused ? 'paused' : 'running';
   const stText = isPaused ? 'PAUSED' : 'RUNNING';
   html+='<div class="wd-status-bar">'+
     '<div class="wd-status-indicator '+stCls+'"></div>'+
-    '<div class="wd-status-text">'+stText+'<span class="sub">'+w.strategy+' \u00B7 '+w.mode+' \u00B7 $'+fmt(w.capitalAllocated,0)+' capital</span></div>'+
+    '<div class="wd-status-text">'+stText+'<span class="sub">'+w.strategy+' \u00B7 '+w.mode+' \u00B7 $'+fmt(portfolioVal,2)+' portfolio</span></div>'+
     '<button class="toggle-btn '+stCls+'" onclick="toggleWalletFromDetail(\\''+w.walletId+'\\','+isPaused+')"><span class="toggle-dot"></span>'+(isPaused?'\u25B6 Start':'\u23F8 Pause')+'</button>'+
     '</div>';
 
@@ -2805,14 +2809,15 @@ function renderWalletDetail(d){
 
   html+='<div class="wd-hero-grid">'+
     '<div class="wd-hero"><div class="label">Total PnL</div><div class="value '+pnlCls(tPnl)+'">$'+fmt(tPnl)+'</div><div class="sub">Realized $'+fmt(w.realizedPnl)+' + Unrealized $'+fmt(uPnl)+'</div></div>'+
-    '<div class="wd-hero"><div class="label">ROI</div><div class="value '+pnlCls(roi)+'">'+pct(roi)+'</div><div class="sub">on $'+fmt(w.capitalAllocated,0)+' capital</div></div>'+
+    '<div class="wd-hero"><div class="label">ROI</div><div class="value '+pnlCls(roi)+'">'+pct(roi)+'</div><div class="sub">on $'+fmt(w.capitalAllocated,2)+' deposit</div></div>'+
     '<div class="wd-hero"><div class="label">Win Rate</div><div class="value '+(s.winRate>=0.5?'pnl-pos':s.closedTrades>0?'pnl-neg':'')+'">'+(s.closedTrades>0?pct(s.winRate):'N/A')+'</div><div class="sub">'+s.closedTrades+' closed of '+s.totalTrades+' total</div></div>'+
     '</div>';
 
   /* Balance group */
   html+='<div class="wd-group"><div class="wd-group-title">Balance</div><div class="wd-group-grid">'+
-    mkSt('Capital','$'+fmt(w.capitalAllocated,0),'')+
+    mkSt('Portfolio','$'+fmt(portfolioVal),'')+
     mkSt('Available','$'+fmt(w.availableBalance),'')+
+    mkSt('Deposit','$'+fmt(w.capitalAllocated,2),'')+
     mkSt('Realized PnL','$'+fmt(w.realizedPnl),pnlCls(w.realizedPnl))+
     mkSt('Unrealized PnL','$'+fmt(uPnl),pnlCls(uPnl))+
     '</div></div>';
