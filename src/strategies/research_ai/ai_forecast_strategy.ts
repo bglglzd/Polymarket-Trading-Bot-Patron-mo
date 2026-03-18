@@ -9,30 +9,43 @@ import { logger } from '../../reporting/logs';
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
    Strategy flow:
-   1. Claude AI analyzes markets for mispricing
-   2. BUY shares when Claude finds a high-confidence edge
-   3. Monitor positions using REAL wallet data (from CLOB sync)
-   4. SELL when profitable (take profit) or cut losses (stop loss)
-   5. Repeat — continuous buy/sell cycling
+   1. Filter markets by volume, liquidity, spread, price range
+   2. Quant factors pre-screen for directional signal
+   3. Claude AI estimates TRUE probability vs market price
+   4. BUY when Claude finds mispricing with confidence
+   5. Position management: trailing TP, tight SL, time exit
+   6. Prediction markets resolve $0/$1 — let winners ride
 
    Position management uses the wallet's live position data,
    NOT phantom fills from order acceptance.
    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
-/* ── Tuning constants ── */
-const MIN_VOLUME = 5_000;
-const MIN_LIQUIDITY = 3_000;
+/* ── Market filters ── */
+const MIN_VOLUME = 1_000;
+const MIN_LIQUIDITY = 500;
 const MIN_HISTORY = 8;
 const MAX_HISTORY = 60;
 const PRICE_FLOOR = 0.15;
 const PRICE_CEILING = 0.85;
+const MAX_SPREAD = 0.05;       // skip markets with > 5¢ spread (500bps)
 const MAX_POSITIONS = 5;
 
-/* ── Exit thresholds (account for ~2% Polymarket fee + spread) ── */
-const TAKE_PROFIT_PCT = 0.12;     // sell when up 12% — ensures profit after 2% fee + spread
-const STOP_LOSS_PCT = 0.25;       // sell when down 25% — cut losses but don't panic on noise
-const TIME_EXIT_MS = 48 * 3600_000; // sell after 48 hours if stagnant
-const FEE_PCT = 0.02;             // Polymarket takes ~2% fee on trades
+/* ── Position sizing ── */
+const RISK_PCT = 0.08;          // risk 8% of capital per trade
+const MIN_SHARES = 8;
+const MAX_SHARES = 30;
+
+/* ── Exit thresholds ── */
+const TAKE_PROFIT_PCT = 0.30;   // take profit at +30% (let winners ride in binary markets)
+const STOP_LOSS_PCT = 0.15;     // cut losses at -15% (tight — prediction markets can gap)
+const TRAILING_ACTIVATION = 0.15; // activate trailing stop after +15%
+const TRAILING_DISTANCE = 0.08;  // trail 8% below high water mark
+const TIME_EXIT_MS = 24 * 3600_000; // exit after 24h if not meaningfully profitable
+const FEE_PCT = 0.02;           // Polymarket ~2% fee per trade
+
+/* ── Claude thresholds ── */
+const MIN_CONFIDENCE = 0.50;    // lowered from 0.55 — Claude's 0.52 is a valid signal
+const MIN_EDGE = 0.015;         // 1.5% edge minimum (covers fees)
 
 type Regime = 'trending' | 'ranging' | 'volatile';
 
@@ -42,14 +55,15 @@ interface FactorResult {
   name: string;
 }
 
-/** Track when we bought something so we know when to apply time exit */
 interface EntryRecord {
   marketId: string;
-  conditionId?: string; // hex condition ID for matching wallet positions after CLOB sync
+  conditionId?: string;
   outcome: 'YES' | 'NO';
   entryPrice: number;
   entryTime: number;
-  exitSubmittedAt?: number; // timestamp when we submitted a sell order
+  exitSubmittedAt?: number;
+  /** High water mark for trailing stop (percentage gain from entry) */
+  highWaterMark: number;
 }
 
 export class AiForecastStrategy extends BaseStrategy {
@@ -61,31 +75,21 @@ export class AiForecastStrategy extends BaseStrategy {
   private claude = new ClaudeAnalyzer();
   private pendingAnalysis = new Map<string, Promise<void>>();
 
-  /** Track when we last placed a BUY order for each market */
   private orderCooldowns = new Map<string, number>();
-  /** Markets that have a pending (unfilled) BUY order */
   private openOrderMarkets = new Set<string>();
-  /** Global cooldown — time of last BUY order on ANY market */
   private lastGlobalOrderTime = 0;
-  /** Minimum time between any two BUY orders (3 minutes) */
-  private globalCooldownMs = 180_000;
-  /** Entry records for positions we opened (for time-based exits) */
+  private globalCooldownMs = 180_000; // 3 min between BUY orders
   private entryRecords = new Map<string, EntryRecord>();
-  /** Markets where we already submitted a SELL (avoid double-sell) */
   private pendingSells = new Set<string>();
-  /** Markets where a SELL failed (phantom position — don't try again) */
   private failedSells = new Set<string>();
-  /** Reverse lookup: hex conditionId → gamma marketId (for matching wallet positions) */
   private conditionToGammaId = new Map<string, string>();
 
   /* ── Market update ──────────────────────────────────────────── */
   override onMarketUpdate(data: MarketData): void {
-    // Only store markets that pass basic filters (saves ~36,000 map entries)
     if (!this.passesFilters(data) && !this.entryRecords.has(data.marketId)) return;
 
     super.onMarketUpdate(data);
 
-    // Build conditionId ↔ gamma ID mapping for position matching
     if (data.conditionId) {
       this.conditionToGammaId.set(data.conditionId, data.marketId);
     }
@@ -107,17 +111,14 @@ export class AiForecastStrategy extends BaseStrategy {
   override onTimer(): void {
     const now = Date.now();
 
-    // Periodic GC: evict low-value markets to prevent OOM (every 10 min)
+    // Periodic GC: evict low-value markets (every 10 min)
     if (now - this.lastGcTime > 600_000) {
       this.lastGcTime = now;
       let evicted = 0;
       for (const [marketId, market] of this.markets) {
-        // Keep markets we have positions in or entry records for
         if (this.entryRecords.has(marketId)) continue;
         if (this.conditionToGammaId.has(marketId)) continue;
-        // Keep markets that pass filters (tradeable)
         if (this.passesFilters(market)) continue;
-        // Evict low-value markets
         this.markets.delete(marketId);
         this.priceHistory.delete(marketId);
         this.volumeHistory.delete(marketId);
@@ -146,17 +147,21 @@ export class AiForecastStrategy extends BaseStrategy {
 
     if (!this.claude.isEnabled()) return;
 
-    // Count OUR positions (ones we placed this session, not legacy wallet positions)
-    // Capital protection is handled in sizePositions() — this limit is for diversification
     const ourPositionCount = this.entryRecords.size;
     if (ourPositionCount >= MAX_POSITIONS) return;
 
-    // Find markets that pass filters and send to Claude for analysis
+    // Send promising markets to Claude for analysis
     const MAX_PENDING_ANALYSES = 3;
     for (const [marketId, market] of this.markets) {
       if (this.pendingAnalysis.size >= MAX_PENDING_ANALYSES) break;
       if (this.pendingAnalysis.has(marketId)) continue;
       if (!this.passesFilters(market)) continue;
+
+      // Skip already-resolved or expired markets
+      if (market.endDate) {
+        const endTime = new Date(market.endDate).getTime();
+        if (!isNaN(endTime) && endTime < now) continue;
+      }
 
       const prices = this.priceHistory.get(marketId) ?? [];
       const volumes = this.volumeHistory.get(marketId) ?? [];
@@ -165,7 +170,7 @@ export class AiForecastStrategy extends BaseStrategy {
       const regime = this.detectRegime(prices);
       const factors = this.runFactors(marketId, market, prices, volumes, regime);
 
-      // Send to Claude if there's any directional signal (1+ factors)
+      // Need at least 1 directional quant factor to trigger Claude
       const yesCount = factors.filter((f) => f.direction === 'YES').length;
       const noCount = factors.filter((f) => f.direction === 'NO').length;
       if (Math.max(yesCount, noCount) < 1) continue;
@@ -203,37 +208,32 @@ export class AiForecastStrategy extends BaseStrategy {
     const signals: Signal[] = [];
     const now = Date.now();
 
-    // Global cooldown — wait between BUY orders
+    // Global cooldown
     const cooldownRemaining = this.globalCooldownMs - (now - this.lastGlobalOrderTime);
     if (cooldownRemaining > 0) {
-      if ((now % 60_000) < 5_000) { // log once per ~60s
+      if ((now % 60_000) < 5_000) {
         logger.info({ cooldownRemaining: Math.round(cooldownRemaining / 1000) }, 'Signal gen: global cooldown active');
       }
       return signals;
     }
 
-    // Count OUR positions (entries we placed), not total wallet positions
-    // Legacy positions from spam era shouldn't block new trading
     const ourPositionCount = this.entryRecords.size;
     if (ourPositionCount >= MAX_POSITIONS) {
       logger.info({ ourPositionCount, MAX_POSITIONS }, 'Signal gen: max own positions reached');
       return signals;
     }
 
-    // Count how many markets pass each filter stage
     let passFilters = 0, hasHistory = 0, hasClaude = 0;
-    const shouldLogFunnel = (now % 30_000) < 5_000; // log every ~30s
+    const shouldLogFunnel = (now % 30_000) < 5_000;
     const openPositions = this.context?.wallet.openPositions ?? [];
 
-    // Markets we already have a position in (from wallet)
-    // Include both raw position IDs AND reverse-mapped gamma IDs
+    // Build set of markets we already have positions in
     const positionMarkets = new Set<string>();
     for (const pos of openPositions) {
       positionMarkets.add(pos.marketId);
       const gId = this.conditionToGammaId.get(pos.marketId);
       if (gId) positionMarkets.add(gId);
     }
-    // Also add all markets we have entry records for
     for (const [mId] of this.entryRecords) {
       positionMarkets.add(mId);
     }
@@ -242,28 +242,33 @@ export class AiForecastStrategy extends BaseStrategy {
       if (!this.passesFilters(market)) continue;
       passFilters++;
 
-      // Skip markets where we already have a position or pending order
       if (positionMarkets.has(marketId)) continue;
       if (this.openOrderMarkets.has(marketId)) continue;
       const lastOrder = this.orderCooldowns.get(marketId) ?? 0;
       if (now - lastOrder < this.cooldownMs) continue;
+
+      // Skip expired markets
+      if (market.endDate) {
+        const endTime = new Date(market.endDate).getTime();
+        if (!isNaN(endTime) && endTime < now) continue;
+      }
 
       const prices = this.priceHistory.get(marketId) ?? [];
       const volumes = this.volumeHistory.get(marketId) ?? [];
       if (prices.length < MIN_HISTORY) continue;
       hasHistory++;
 
-      // REQUIRE Claude AI analysis
+      // Get Claude analysis via public API (no more `as any` hack)
       const claudeResult = this.claude.isEnabled()
-        ? (this.claude as any).cache?.get(marketId)?.analysis ?? null
+        ? this.claude.getAnalysis(marketId)
         : null;
 
       if (!claudeResult || claudeResult.direction === 'SKIP') continue;
 
       hasClaude++;
 
-      // Claude alone can trigger a trade if confident enough
-      if (claudeResult.confidence < 0.55 || claudeResult.edge < 0.02) {
+      // Check confidence and edge thresholds
+      if (claudeResult.confidence < MIN_CONFIDENCE || claudeResult.edge < MIN_EDGE) {
         logger.info(
           { marketId, conf: claudeResult.confidence, edge: claudeResult.edge },
           `Skipped: conf=${claudeResult.confidence.toFixed(2)} edge=${claudeResult.edge.toFixed(3)} below threshold`,
@@ -275,14 +280,14 @@ export class AiForecastStrategy extends BaseStrategy {
       let confidence: number = claudeResult.confidence;
       let edge: number = claudeResult.edge;
 
-      // Boost confidence if quant factors agree
+      // Boost confidence if 2+ quant factors agree
       const regime = this.detectRegime(prices);
       const factors = this.runFactors(marketId, market, prices, volumes, regime);
       const agreeingFactors = factors.filter((f) => f.direction === outcome);
       if (agreeingFactors.length >= 2) {
         const avgStrength = agreeingFactors.reduce((s, f) => s + f.strength, 0) / agreeingFactors.length;
         confidence = Math.min(0.90, confidence + avgStrength * 0.1);
-        edge = Math.min(0.10, edge + avgStrength * 0.01);
+        edge = Math.min(0.15, edge + avgStrength * 0.01);
       }
 
       consoleLog.info(
@@ -300,7 +305,7 @@ export class AiForecastStrategy extends BaseStrategy {
       });
     }
 
-    // Log funnel periodically (~30s) or when there are signals
+    // Log funnel
     if (signals.length > 0 || (shouldLogFunnel && (passFilters > 0 || hasClaude > 0))) {
       logger.info(
         { total: this.markets.size, passFilters, hasHistory, hasClaude, signals: signals.length },
@@ -309,7 +314,6 @@ export class AiForecastStrategy extends BaseStrategy {
     }
 
     signals.sort((a, b) => b.confidence * b.edge - a.confidence * a.edge);
-    // Only trade the single best opportunity per cycle
     return signals.slice(0, 1);
   }
 
@@ -324,7 +328,7 @@ export class AiForecastStrategy extends BaseStrategy {
       const market = this.markets.get(signal.marketId);
       if (!market) continue;
 
-      // Resolve the CLOB token ID for this outcome
+      // Resolve CLOB token ID
       let tokenId: string | undefined;
       if (market.clobTokenIds && market.outcomes) {
         const outcomeIdx = market.outcomes.findIndex(
@@ -340,30 +344,28 @@ export class AiForecastStrategy extends BaseStrategy {
         continue;
       }
 
-      // Price: buy at the ask + 1¢ premium for fill certainty
-      // market.bid/ask are YES-only from Gamma API
-      // For NO outcome: NO ask ≈ 1 - YES_bid
+      // Price: buy at ask + 1¢ for fill certainty
       let price: number;
       if (signal.side === 'BUY') {
         const rawAsk = signal.outcome === 'YES'
           ? market.ask
-          : 1 - market.bid; // NO ask ≈ complement of YES bid
+          : 1 - market.bid;
         price = Number(Math.max(0.01, Math.min(0.99, rawAsk + 0.01)).toFixed(2));
       } else {
         const rawBid = signal.outcome === 'YES'
           ? market.bid
-          : 1 - market.ask; // NO bid ≈ complement of YES ask
+          : 1 - market.ask;
         price = Number(Math.max(0.01, Math.min(0.99, rawBid - 0.01)).toFixed(2));
       }
 
-      // Size: 5-10 shares, capped at 5% of capital
-      const maxCost = capital * 0.05;
+      // Size: risk RISK_PCT of capital per trade, clamped to MIN/MAX shares
+      const maxCost = capital * RISK_PCT;
       const maxShares = Math.floor(maxCost / Math.max(price, 0.01));
-      const size = Math.max(5, Math.min(maxShares, 10));
+      const size = Math.max(MIN_SHARES, Math.min(maxShares, MAX_SHARES));
 
       const orderCost = price * size;
-      if (orderCost > capital * 0.10) continue; // safety: don't spend >10% in one order
-      if (orderCost > capital - 5) continue; // keep $5 reserve
+      if (orderCost > capital * 0.15) continue; // safety: don't spend >15% in one order
+      if (orderCost > capital - 3) continue; // keep $3 reserve
 
       // Record cooldowns
       this.orderCooldowns.set(signal.marketId, now);
@@ -378,16 +380,15 @@ export class AiForecastStrategy extends BaseStrategy {
         outcome: signal.outcome,
         entryPrice: price,
         entryTime: now,
+        highWaterMark: 0,
       });
-      // Reverse mapping so managePositions can find entries after CLOB sync
-      // (wallet positions use hex conditionId, entry records use gamma numericId)
       if (condId) {
         this.conditionToGammaId.set(condId, signal.marketId);
       }
 
       consoleLog.success(
         'STRATEGY',
-        `BUY ${signal.outcome} ×${size} @ $${price.toFixed(2)} on ${market.question?.slice(0, 50) ?? signal.marketId.slice(0, 20)}…`,
+        `BUY ${signal.outcome} ×${size} @ $${price.toFixed(2)} ($${orderCost.toFixed(2)}) on ${market.question?.slice(0, 50) ?? signal.marketId.slice(0, 20)}…`,
       );
 
       orders.push({
@@ -405,10 +406,9 @@ export class AiForecastStrategy extends BaseStrategy {
     return orders;
   }
 
-  /* ── Position tracking via engine callback ──────────────────── */
+  /* ── Position tracking callback ──────────────────────────────── */
   override notifyFill(order: OrderRequest): void {
     if (order.strategy !== this.name) return;
-    // Just mark as having an open order — real fill detection is via wallet sync
     this.openOrderMarkets.add(order.marketId);
     consoleLog.info(
       'STRATEGY',
@@ -420,7 +420,7 @@ export class AiForecastStrategy extends BaseStrategy {
     return;
   }
 
-  /* ── Manage positions: SELL when profitable or cut losses ──── */
+  /* ── Manage positions: trailing stop, TP, SL, time exit ────── */
   override managePositions(): void {
     const positions = this.context?.wallet.openPositions ?? [];
     if (positions.length === 0) return;
@@ -430,31 +430,26 @@ export class AiForecastStrategy extends BaseStrategy {
 
     for (const pos of positions) {
       const posKey = pos.marketId;
-      // Also get the gamma ID for market cache lookups
       const gammaId = this.conditionToGammaId.get(pos.marketId) ?? pos.marketId;
 
-      // Skip if we already submitted a sell or a previous sell failed (phantom position)
       if (this.pendingSells.has(posKey) || this.pendingSells.has(gammaId)) continue;
       if (this.failedSells.has(posKey) || this.failedSells.has(gammaId)) continue;
 
-      // Only manage positions we actually bought (have an entry record)
-      // Wallet positions may use hex conditionId (after CLOB sync) or gamma numericId (right after buy)
+      // Find entry record
       let entry = this.entryRecords.get(pos.marketId);
       if (!entry) {
-        // Try reverse lookup: conditionId → gamma ID
-        const gammaId = this.conditionToGammaId.get(pos.marketId);
-        if (gammaId) entry = this.entryRecords.get(gammaId);
+        const mapped = this.conditionToGammaId.get(pos.marketId);
+        if (mapped) entry = this.entryRecords.get(mapped);
       }
       if (!entry) continue;
 
-      // Don't sell a position we bought in the last 60 seconds (let it settle)
+      // Don't sell within 60 seconds of entry
       if (now - entry.entryTime < 60_000) continue;
 
-      // Get current market data (try gamma ID first, then position's ID)
+      // Get current market data
       const market = this.markets.get(gammaId) ?? this.markets.get(pos.marketId);
       if (!market) continue;
 
-      // Get the current mid price for this outcome
       const currentPrice = pos.outcome === 'YES'
         ? (market.outcomePrices[0] ?? 0.5)
         : (market.outcomePrices[1] ?? 1 - (market.outcomePrices[0] ?? 0.5));
@@ -462,38 +457,50 @@ export class AiForecastStrategy extends BaseStrategy {
       const entryPrice = pos.avgPrice;
       if (entryPrice <= 0) continue;
 
-      // Calculate unrealized P&L percentage (gross, before fees)
+      // Calculate P&L
       const pnlPct = (currentPrice - entryPrice) / entryPrice;
-      // Net P&L after fees on both entry and exit (~2% each side)
       const netPnlPct = pnlPct - FEE_PCT * 2;
-      // Estimated dollar profit if we sell now
       const estProfit = (currentPrice - entryPrice) * pos.size - (currentPrice * pos.size * FEE_PCT);
-
-      // Hold time for time-based exit
       const holdTime = now - entry.entryTime;
+
+      // Update high water mark for trailing stop
+      if (pnlPct > entry.highWaterMark) {
+        entry.highWaterMark = pnlPct;
+      }
 
       let shouldSell = false;
       let reason = '';
 
-      // Take profit: sell when up 12%+ (net profit after fees is ~8%)
-      if (pnlPct >= TAKE_PROFIT_PCT && estProfit > 0.10) {
+      // 1. TRAILING STOP: activated after +15%, sells if drops 8% from peak
+      if (entry.highWaterMark >= TRAILING_ACTIVATION) {
+        const drawdownFromPeak = entry.highWaterMark - pnlPct;
+        if (drawdownFromPeak >= TRAILING_DISTANCE) {
+          shouldSell = true;
+          reason = `TRAILING STOP (peak +${(entry.highWaterMark * 100).toFixed(1)}%, now +${(pnlPct * 100).toFixed(1)}%, drop ${(drawdownFromPeak * 100).toFixed(1)}%)`;
+        }
+      }
+
+      // 2. TAKE PROFIT: hard cap at +30%
+      if (!shouldSell && pnlPct >= TAKE_PROFIT_PCT && estProfit > 0.20) {
         shouldSell = true;
         reason = `TAKE PROFIT +${(pnlPct * 100).toFixed(1)}% (net ~$${estProfit.toFixed(2)})`;
       }
-      // Stop loss: sell when down 25%+
-      else if (pnlPct <= -STOP_LOSS_PCT) {
+
+      // 3. STOP LOSS: cut at -15%
+      if (!shouldSell && pnlPct <= -STOP_LOSS_PCT) {
         shouldSell = true;
         reason = `STOP LOSS ${(pnlPct * 100).toFixed(1)}%`;
       }
-      // Time exit: sell after 48 hours if not meaningfully profitable
-      else if (holdTime > TIME_EXIT_MS && netPnlPct < 0.05) {
+
+      // 4. TIME EXIT: 24h with < 5% net profit
+      if (!shouldSell && holdTime > TIME_EXIT_MS && netPnlPct < 0.05) {
         shouldSell = true;
         reason = `TIME EXIT (${Math.round(holdTime / 3600_000)}h, net ${(netPnlPct * 100).toFixed(1)}%)`;
       }
 
       if (!shouldSell) continue;
 
-      // Resolve token ID for the sell order
+      // Resolve token ID
       let tokenId: string | undefined;
       if (market.clobTokenIds && market.outcomes) {
         const outcomeIdx = market.outcomes.findIndex(
@@ -509,8 +516,7 @@ export class AiForecastStrategy extends BaseStrategy {
         continue;
       }
 
-      // Sell at the bid price - 1¢ for quick execution
-      // For NO outcome: NO bid ≈ 1 - YES_ask
+      // Sell at bid - 1¢ for quick fill
       const rawBid = pos.outcome === 'YES'
         ? market.bid
         : 1 - market.ask;
@@ -523,7 +529,6 @@ export class AiForecastStrategy extends BaseStrategy {
           `(entry $${entryPrice.toFixed(2)}) on ${market.question?.slice(0, 50) ?? pos.marketId.slice(0, 20)}…`,
       );
 
-      // Mark as pending sell to avoid duplicate exits
       this.pendingSells.add(posKey);
       if (entry) entry.exitSubmittedAt = now;
 
@@ -541,7 +546,7 @@ export class AiForecastStrategy extends BaseStrategy {
   }
 
   /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-     Quantitative Factors (used for Claude context + signal boost)
+     Quantitative Factors (pre-screen for Claude + confidence boost)
      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 
   private factorMomentum(prices: number[]): FactorResult {
@@ -680,6 +685,8 @@ export class AiForecastStrategy extends BaseStrategy {
   private passesFilters(market: MarketData): boolean {
     if (market.volume24h < MIN_VOLUME) return false;
     if (market.liquidity < MIN_LIQUIDITY) return false;
+    // Spread filter: skip illiquid markets where entry/exit costs eat the edge
+    if (market.spread > MAX_SPREAD) return false;
     const yesPrice = market.outcomePrices[0] ?? 0.5;
     if (yesPrice < PRICE_FLOOR || yesPrice > PRICE_CEILING) return false;
     return true;

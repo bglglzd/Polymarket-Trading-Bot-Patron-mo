@@ -38,7 +38,7 @@ export class MarketFetcher {
   /** Page size for Gamma API pagination */
   private static readonly PAGE_SIZE = 100;
 
-  constructor(gammaApi = 'https://gamma-api.polymarket.com', limit = 0) {
+  constructor(gammaApi = 'https://gamma-api.polymarket.com', limit = 1000) {
     this.gammaApi = gammaApi;
     this.limit = limit;
   }
@@ -73,6 +73,11 @@ export class MarketFetcher {
       const response = await fetch(url);
 
       if (!response.ok) {
+        if (response.status === 429) {
+          // Rate limited — wait and retry this page
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
         logger.error({ status: response.status, offset }, 'Gamma API page request failed');
         break;
       }
@@ -91,6 +96,9 @@ export class MarketFetcher {
       if (page.length < pageSize) break;
 
       offset += pageSize;
+
+      // Rate-limit: 150ms between pages to avoid Cloudflare blocks
+      await new Promise((r) => setTimeout(r, 150));
     }
 
     return all;

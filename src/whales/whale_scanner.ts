@@ -1031,25 +1031,22 @@ export class WhaleScanner {
         }));
     };
 
-    /* Fire all pages concurrently */
-    const pagePromises = Array.from({ length: maxPages }, (_, i) => fetchPage(i));
-    const results = await Promise.allSettled(pagePromises);
-
+    /* Fetch pages sequentially to avoid rate-limit storms */
     const allTrades: ClobTrade[] = [];
-    let rejectedCount = 0;
-    let firstRejection: unknown = null;
-    for (const r of results) {
-      if (r.status === 'fulfilled' && r.value.length > 0) {
-        allTrades.push(...r.value);
-      } else if (r.status === 'rejected') {
-        rejectedCount++;
-        if (!firstRejection) firstRejection = r.reason;
+    for (let i = 0; i < maxPages; i++) {
+      try {
+        const trades = await fetchPage(i);
+        if (trades.length > 0) {
+          allTrades.push(...trades);
+        }
+        // Stop paging if we got fewer than limit (no more pages)
+        if (trades.length < limit) break;
+      } catch (err) {
+        if (i === 0) {
+          throw err instanceof Error ? err : new Error(String(err));
+        }
+        break; // partial results are fine
       }
-    }
-
-    /* If every single page rejected (not just empty), propagate the error */
-    if (rejectedCount === results.length && rejectedCount > 0) {
-      throw firstRejection instanceof Error ? firstRejection : new Error(String(firstRejection));
     }
 
     this.perfTradesFetched += allTrades.length;
@@ -1742,8 +1739,9 @@ export class WhaleScanner {
         clearTimeout(timer);
         if (res.ok) return res;
         if (res.status === 429) {
-          const retryAfter = parseInt(res.headers.get('retry-after') || '5', 10);
-          await this.sleep(retryAfter * 1000);
+          const hdr = parseInt(res.headers.get('retry-after') || '0', 10);
+          const backoff = Math.max(hdr, 2) * 1000 * Math.pow(2, attempt); // min 2s, exponential
+          await this.sleep(backoff);
           continue;
         }
         if (res.status >= 500) {

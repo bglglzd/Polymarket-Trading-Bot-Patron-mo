@@ -20,8 +20,6 @@ const NEG_RISK_ADAPTER = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296';
 const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const PROXY_FACTORY = '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052';
 
-const GAMMA_API = 'https://gamma-api.polymarket.com';
-
 // Function selectors (first 4 bytes of keccak256)
 function selector(sig: string): string {
   return keccak256(toUtf8Bytes(sig)).slice(0, 10);
@@ -30,6 +28,8 @@ function selector(sig: string): string {
 const CTF_REDEEM_SEL = selector('redeemPositions(address,bytes32,bytes32,uint256[])');
 const NEG_RISK_REDEEM_SEL = selector('redeemPositions(bytes32,uint256[])');
 const PAYOUT_DENOM_SEL = selector('payoutDenominator(bytes32)');
+const BALANCE_OF_SEL = selector('balanceOf(address,uint256)');
+const GET_POSITION_ID_SEL = selector('getPositionId(bytes32,bool)');
 const PROXY_SEL = selector('proxy((uint8,address,uint256,bytes)[])');
 
 function pad32(hex: string): string {
@@ -39,8 +39,6 @@ function pad32(hex: string): string {
 function uint256(n: bigint | number): string {
   return BigInt(n).toString(16).padStart(64, '0');
 }
-
-const MAX_UINT256 = (1n << 256n) - 1n;
 
 export interface RedeemResult {
   conditionId: string;
@@ -72,9 +70,10 @@ export class PositionRedeemer {
       const positions = (await resp.json()) as Array<{
         conditionId?: string; currentValue?: number;
         redeemable?: boolean; outcome?: string; title?: string;
+        negativeRisk?: boolean;
       }>;
 
-      const toRedeem = new Map<string, { value: number; name: string }>();
+      const toRedeem = new Map<string, { value: number; name: string; negRisk: boolean }>();
       for (const pos of positions) {
         const val = pos.currentValue ?? 0;
         const redeemable = pos.redeemable ?? false;
@@ -84,6 +83,7 @@ export class PositionRedeemer {
           toRedeem.set(cid, {
             value: (existing?.value ?? 0) + val,
             name: pos.title ?? cid.slice(0, 16),
+            negRisk: pos.negativeRisk ?? existing?.negRisk ?? false,
           });
         }
       }
@@ -109,7 +109,7 @@ export class PositionRedeemer {
 
       const results: RedeemResult[] = [];
       for (const [conditionId, info] of toRedeem) {
-        const result = await this.redeemPosition(conditionId, info.name);
+        const result = await this.redeemPosition(conditionId, info.name, info.negRisk);
         if (result.success) {
           result.usdcRedeemed = info.value;
           result.marketName = info.name;
@@ -134,7 +134,7 @@ export class PositionRedeemer {
   }
 
   /** Redeem a single resolved position */
-  async redeemPosition(conditionId: string, name?: string): Promise<RedeemResult> {
+  async redeemPosition(conditionId: string, name?: string, negRisk?: boolean): Promise<RedeemResult> {
     const cid = conditionId.replace('0x', '').padStart(64, '0');
 
     // 1. Check if resolved on-chain
@@ -143,14 +143,18 @@ export class PositionRedeemer {
       return { conditionId, success: false, error: 'not_resolved_on_chain' };
     }
 
-    // 2. Check neg_risk
-    const negRisk = await this.checkNegRisk(conditionId);
+    // 2. neg_risk flag passed from data API (negativeRisk field)
+    //    Falls back to Gamma API query if not provided
+    const isNegRisk = negRisk ?? await this.checkNegRisk(conditionId);
 
     // 3. Encode redeem call
     let redeemData: string;
     let targetContract: string;
-    if (negRisk) {
-      redeemData = this.encodeNegRiskRedeem(cid);
+    if (isNegRisk) {
+      // For neg_risk: query actual token balances (YES/NO) and pass them as amounts
+      const balances = await this.getNegRiskBalances(conditionId);
+      logger.info({ conditionId: conditionId.slice(0, 16), yesBalance: balances[0].toString(), noBalance: balances[1].toString() }, 'Neg risk token balances');
+      redeemData = this.encodeNegRiskRedeem(cid, balances[0], balances[1]);
       targetContract = NEG_RISK_ADAPTER;
     } else {
       redeemData = this.encodeCtfRedeem(cid);
@@ -163,7 +167,7 @@ export class PositionRedeemer {
     // 5. Send transaction
     try {
       const txHash = await this.sendTransaction(PROXY_FACTORY, proxyData);
-      logger.info({ conditionId: conditionId.slice(0, 16), txHash, negRisk }, 'Redeem tx sent');
+      logger.info({ conditionId: conditionId.slice(0, 16), txHash, negRisk: isNegRisk }, 'Redeem tx sent');
 
       // 6. Wait for receipt
       const receipt = await this.waitForReceipt(txHash);
@@ -198,16 +202,21 @@ export class PositionRedeemer {
   }
 
   private async checkNegRisk(conditionId: string): Promise<boolean> {
+    // Fallback: query data API positions for this condition to get negativeRisk flag
     try {
       const resp = await fetch(
-        `${GAMMA_API}/markets?condition_id=${conditionId}`,
+        `https://data-api.polymarket.com/positions?user=${this.proxyWallet}`,
       );
       if (!resp.ok) return false;
-      const markets = (await resp.json()) as Array<{ neg_risk?: boolean }>;
-      return markets?.[0]?.neg_risk ?? false;
+      const positions = (await resp.json()) as Array<{
+        conditionId?: string; negativeRisk?: boolean;
+      }>;
+      const match = positions.find((p) => p.conditionId === conditionId);
+      if (match?.negativeRisk !== undefined) return match.negativeRisk;
     } catch {
-      return false;
+      // ignore
     }
+    return false;
   }
 
   private async getPolBalance(): Promise<number> {
@@ -237,16 +246,66 @@ export class PositionRedeemer {
     );
   }
 
-  private encodeNegRiskRedeem(cidHex: string): string {
-    // redeemPositions(bytes32, uint256[])
+  private encodeNegRiskRedeem(cidHex: string, yesAmount: bigint, noAmount: bigint): string {
+    // redeemPositions(bytes32 conditionId, uint256[] amounts)
+    // amounts = [yesTokenBalance, noTokenBalance] — actual balances, NOT max
     return (
       NEG_RISK_REDEEM_SEL +
       cidHex +                     // conditionId
       uint256(64n) +               // offset to amounts array
       uint256(2n) +                // array length = 2
-      uint256(MAX_UINT256) +       // amounts[0] = max
-      uint256(MAX_UINT256)         // amounts[1] = max
+      uint256(yesAmount) +         // amounts[0] = YES token balance
+      uint256(noAmount)            // amounts[1] = NO token balance
     );
+  }
+
+  /** Query on-chain YES/NO token balances for a neg_risk position */
+  private async getNegRiskBalances(conditionId: string): Promise<[bigint, bigint]> {
+    // Get YES and NO positionIds from NegRiskAdapter.getPositionId(questionId, bool)
+    // The questionId = negRiskMarketID for question index 0, but we derive it from conditionId
+    // by querying the NegRiskAdapter: the negRiskMarketID maps to conditionId via getConditionId()
+    // However, we don't know the questionId from the conditionId directly.
+    //
+    // Alternative: query the data API asset field which gives us the YES positionId directly.
+    // For now, get balances from CTF.balanceOf(proxy, positionId) using the data API asset IDs.
+    //
+    // Simplest approach: query positions from data API and use the asset/oppositeAsset fields.
+    try {
+      const resp = await fetch(
+        `https://data-api.polymarket.com/positions?user=${this.proxyWallet}`,
+      );
+      if (!resp.ok) return [0n, 0n];
+      const positions = (await resp.json()) as Array<{
+        conditionId?: string; asset?: string; oppositeAsset?: string;
+      }>;
+      const pos = positions.find((p) => p.conditionId === conditionId);
+      if (!pos?.asset) return [0n, 0n];
+
+      // Query CTF.balanceOf for both YES and NO tokens
+      const yesId = BigInt(pos.asset).toString(16).padStart(64, '0');
+      const noId = pos.oppositeAsset
+        ? BigInt(pos.oppositeAsset).toString(16).padStart(64, '0')
+        : '0'.repeat(64);
+
+      const proxyPad = pad32(this.proxyWallet);
+
+      const [yesResp, noResp] = await Promise.all([
+        this.rpcCall('eth_call', [
+          { to: CTF_ADDRESS, data: BALANCE_OF_SEL + proxyPad + yesId },
+          'latest',
+        ]),
+        this.rpcCall('eth_call', [
+          { to: CTF_ADDRESS, data: BALANCE_OF_SEL + proxyPad + noId },
+          'latest',
+        ]),
+      ]);
+
+      const yes = yesResp?.result ? BigInt(yesResp.result) : 0n;
+      const no = noResp?.result ? BigInt(noResp.result) : 0n;
+      return [yes, no];
+    } catch {
+      return [0n, 0n];
+    }
   }
 
   private encodeProxyCall(target: string, innerCalldata: string): string {

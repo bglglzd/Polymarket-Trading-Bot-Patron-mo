@@ -22,6 +22,7 @@ wallets:
     mode: LIVE
     strategy: ai_forecast
     capital: 99.36
+    inception_date: "2026-03-14T22:50:00Z"  # ignore manual trades before bot started
     risk_limits:
       max_position_size: 25
       max_exposure_per_market: 20
@@ -93,7 +94,7 @@ whale_tracking:
   dbPath: .runtime/whales.db
   pollIntervalMs: 30000
   backfillBatchSize: 100
-  maxRequestsPerMinute: 240
+  maxRequestsPerMinute: 60
   backoffBaseMs: 1000
   backoffMaxMs: 60000
   candidateScanIntervalMs: 300000
@@ -132,12 +133,12 @@ whale_tracking:
   metadataCacheTtlMs: 3600000
   scanner:
     enabled: true
-    scanIntervalMs: 600000
-    marketsPerScan: 50
+    scanIntervalMs: 900000
+    marketsPerScan: 25
     minMarketVolume24hUsd: 10000
     minMarketLiquidityUsd: 10000
-    tradesPerMarket: 500
-    tradePageDepth: 5
+    tradesPerMarket: 200
+    tradePageDepth: 2
     minAddressTrades: 5
     minAddressVolumeUsd: 5000
     minWinRate: 0.52
@@ -151,7 +152,7 @@ whale_tracking:
     clusterDetectionEnabled: true
     clusterMinWhales: 2
     clusterWindowHours: 48
-    parallelFetchBatch: 16
+    parallelFetchBatch: 4
     apiPool:
       enabled: true
       selectionStrategy: least-loaded

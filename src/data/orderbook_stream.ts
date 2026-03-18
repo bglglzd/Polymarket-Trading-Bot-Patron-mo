@@ -15,10 +15,12 @@ export class OrderbookStream extends EventEmitter {
   /** Cache of latest data keyed by marketId so strategies see history */
   private readonly cache = new Map<string, MarketData>();
   private pollCount = 0;
+  /** Max markets to keep in cache (top by volume); prevents unbounded memory growth */
+  private static readonly MAX_CACHE_SIZE = 2000;
 
-  constructor(gammaApi?: string, pollMs = 15_000) {
+  constructor(gammaApi?: string, pollMs = 120_000) {
     super();
-    this.fetcher = new MarketFetcher(gammaApi);
+    this.fetcher = new MarketFetcher(gammaApi, 1000);
     this.pollMs = pollMs;
   }
 
@@ -59,6 +61,24 @@ export class OrderbookStream extends EventEmitter {
       }
       this.pollCount++;
       const newMarkets = this.cache.size - prevSize;
+
+      // Evict stale markets that weren't refreshed in this poll (no longer active/open)
+      // Keep fresh IDs from this poll to determine what's stale
+      const freshIds = new Set(markets.map((m) => m.marketId));
+      if (this.cache.size > OrderbookStream.MAX_CACHE_SIZE) {
+        let evicted = 0;
+        for (const [id] of this.cache) {
+          if (!freshIds.has(id)) {
+            this.cache.delete(id);
+            evicted++;
+          }
+          if (this.cache.size <= OrderbookStream.MAX_CACHE_SIZE) break;
+        }
+        if (evicted > 0) {
+          logger.info({ evicted, remaining: this.cache.size }, 'OrderbookStream: evicted stale markets');
+        }
+      }
+
       consoleLog.info('SCAN', `Poll #${this.pollCount} complete — ${markets.length} markets fetched, ${this.cache.size} cached${newMarkets > 0 ? `, ${newMarkets} new` : ''}`, {
         pollNumber: this.pollCount,
         fetched: markets.length,

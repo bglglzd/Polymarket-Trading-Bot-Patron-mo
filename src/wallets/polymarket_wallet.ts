@@ -4,6 +4,24 @@ import { WalletConfig, WalletState, TradeRecord, Position } from '../types';
 import { logger } from '../reporting/logs';
 import { PositionRedeemer } from './redeemer';
 
+/* ── Sanitize CLOB client console output ──
+   The @polymarket/clob-client library uses console.error to dump full
+   request objects including API keys, signatures, and passphrases.
+   Intercept and redact any output containing sensitive header fields. */
+const SENSITIVE_KEYS = ['POLY_API_KEY', 'POLY_PASSPHRASE', 'POLY_SIGNATURE', 'POLY_SECRET'];
+const origConsoleError = console.error;
+console.error = (...args: unknown[]) => {
+  const text = args.map(String).join(' ');
+  if (text.includes('[CLOB Client]')) {
+    // Redact the full dump — log a short, safe version
+    const statusMatch = text.match(/"status"\s*:\s*(\d+)/);
+    const status = statusMatch ? statusMatch[1] : 'unknown';
+    logger.warn({ status }, 'CLOB Client request error (details redacted for security)');
+    return;
+  }
+  origConsoleError.apply(console, args);
+};
+
 export class PolymarketWallet {
   private state: WalletState;
   private readonly trades: TradeRecord[] = [];
@@ -24,6 +42,15 @@ export class PolymarketWallet {
   private marketNames = new Map<string, string>();
   /** Original deposit from config — used as baseline for balance estimation */
   private readonly initialDeposit: number;
+  /** getMarket() cache with 5-minute TTL to avoid hammering CLOB API */
+  private marketCache = new Map<string, { data: any; ts: number }>();
+  private static readonly MARKET_CACHE_TTL = 5 * 60_000;
+  /** Etherscan balance cache with 5-minute TTL */
+  private etherscanCache: { balance: number; ts: number } | null = null;
+  private static readonly ETHERSCAN_CACHE_TTL = 5 * 60_000;
+  /** Simple CLOB rate limiter: min 500ms between API calls */
+  private lastClobCallTime = 0;
+  private static readonly CLOB_MIN_INTERVAL = 500;
 
   constructor(config: WalletConfig, assignedStrategy: string) {
     this.state = {
@@ -163,6 +190,55 @@ export class PolymarketWallet {
     return this.marketNames.get(conditionId);
   }
 
+  /** Wait for CLOB rate limit (min 500ms between calls) */
+  private async clobRateWait(): Promise<void> {
+    const now = Date.now();
+    const wait = PolymarketWallet.CLOB_MIN_INTERVAL - (now - this.lastClobCallTime);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    this.lastClobCallTime = Date.now();
+  }
+
+  /** Cached wrapper around clob.getMarket() — 5 min TTL */
+  private async cachedGetMarket(conditionId: string): Promise<any> {
+    const cached = this.marketCache.get(conditionId);
+    if (cached && Date.now() - cached.ts < PolymarketWallet.MARKET_CACHE_TTL) {
+      return cached.data;
+    }
+    if (!this.clob) return null;
+    await this.clobRateWait();
+    const data = await this.clob.getMarket(conditionId);
+    if (data) {
+      this.marketCache.set(conditionId, { data, ts: Date.now() });
+    }
+    return data;
+  }
+
+  /** Cached Etherscan USDC balance fetch — 5 min TTL */
+  private async cachedEtherscanBalance(): Promise<number> {
+    if (this.etherscanCache && Date.now() - this.etherscanCache.ts < PolymarketWallet.ETHERSCAN_CACHE_TTL) {
+      return this.etherscanCache.balance;
+    }
+    const proxyAddr = process.env.POLYMARKET_PROXY_ADDRESS;
+    const etherscanKey = process.env.ETHERSCAN_API_KEY;
+    if (!proxyAddr || !etherscanKey) return 0;
+    try {
+      const url =
+        `https://api.etherscan.io/v2/api?chainid=137&module=account` +
+        `&action=tokenbalance&contractaddress=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` +
+        `&address=${proxyAddr}&tag=latest&apikey=${etherscanKey}`;
+      const resp = await fetch(url);
+      const data = (await resp.json()) as { status: string; result: string };
+      if (data.status === '1') {
+        const balance = parseInt(data.result, 10) / 1e6;
+        this.etherscanCache = { balance, ts: Date.now() };
+        return balance;
+      }
+    } catch {
+      // Return cached value if available, else 0
+    }
+    return this.etherscanCache?.balance ?? 0;
+  }
+
   updateBalance(delta: number): void {
     this.state.availableBalance += delta;
   }
@@ -186,7 +262,7 @@ export class PolymarketWallet {
     if (!this.clob) return { resolved: false, won: false, payout: 0 };
 
     try {
-      const market = await this.clob.getMarket(conditionId);
+      const market = await this.cachedGetMarket(conditionId);
       if (!market) return { resolved: false, won: false, payout: 0 };
 
       // Cache market name
@@ -224,6 +300,7 @@ export class PolymarketWallet {
     if (!this.clob || !this.ready) return;
 
     try {
+      await this.clobRateWait();
       const clobTrades = await this.clob.getTrades();
 
       // Sort chronologically
@@ -374,25 +451,9 @@ export class PolymarketWallet {
       }
 
       // Compute real financial state
-      // Try to fetch actual USDC balance from Etherscan (proxy wallet)
-      let usdcBalance = 0;
+      // Try to fetch actual USDC balance from Etherscan (cached, 5 min TTL)
+      let usdcBalance = await this.cachedEtherscanBalance();
       const proxyAddr = process.env.POLYMARKET_PROXY_ADDRESS;
-      const etherscanKey = process.env.ETHERSCAN_API_KEY;
-      if (proxyAddr && etherscanKey) {
-        try {
-          const url =
-            `https://api.etherscan.io/v2/api?chainid=137&module=account` +
-            `&action=tokenbalance&contractaddress=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` +
-            `&address=${proxyAddr}&tag=latest&apikey=${etherscanKey}`;
-          const resp = await fetch(url);
-          const data = (await resp.json()) as { status: string; result: string };
-          if (data.status === '1') {
-            usdcBalance = parseInt(data.result, 10) / 1e6;
-          }
-        } catch {
-          // Fallback below
-        }
-      }
 
       // Fallback: estimate from trade history if Etherscan didn't work
       if (usdcBalance < 0.01) {
@@ -490,13 +551,13 @@ export class PolymarketWallet {
       // Sort trades by timestamp (resolutions may have been appended at end)
       this.trades.sort((a, b) => a.timestamp - b.timestamp);
 
-      // Resolve market names for any markets not yet in cache
+      // Resolve market names for any markets not yet in cache (max 5 per sync to limit API calls)
       const unknownMarkets = [
         ...new Set(this.trades.map((t) => t.marketId)),
-      ].filter((id) => !this.marketNames.has(id));
+      ].filter((id) => !this.marketNames.has(id)).slice(0, 5);
       for (const conditionId of unknownMarkets) {
         try {
-          const market = await this.clob!.getMarket(conditionId);
+          const market = await this.cachedGetMarket(conditionId);
           if ((market as any)?.question) {
             this.marketNames.set(conditionId, (market as any).question);
           }
@@ -550,9 +611,10 @@ export class PolymarketWallet {
     const side = request.side === 'BUY' ? Side.BUY : Side.SELL;
 
     try {
-      // Get tick size for this token
+      // Get tick size for this token (rate-limited)
       let tickSize = '0.01'; // default
       try {
+        await this.clobRateWait();
         tickSize = await this.clob.getTickSize(tokenID);
       } catch {
         // Use default
@@ -571,6 +633,7 @@ export class PolymarketWallet {
         'Placing LIVE order on Polymarket',
       );
 
+      await this.clobRateWait();
       const resp = await this.clob.createAndPostOrder(
         {
           tokenID,
@@ -655,7 +718,10 @@ export class PolymarketWallet {
           'LIVE order placed successfully',
         );
       } else {
-        logger.error({ response: resp }, 'Polymarket order rejected');
+        const errMsg = (resp as any)?.error ?? 'order rejected';
+        const safeStatus = (resp as any)?.status ?? (resp as any)?.errorCode ?? 'unknown';
+        logger.error({ status: safeStatus, error: typeof errMsg === 'string' ? errMsg.slice(0, 200) : String(errMsg) }, 'Polymarket order rejected');
+        throw new Error(`Order rejected: ${typeof errMsg === 'string' ? errMsg.slice(0, 100) : errMsg}`);
       }
     } catch (err: any) {
       logger.error(
@@ -668,6 +734,7 @@ export class PolymarketWallet {
         },
         'LIVE order failed',
       );
+      throw err; // Propagate so callers know the order failed
     }
   }
 }

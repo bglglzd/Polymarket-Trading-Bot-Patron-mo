@@ -14,6 +14,8 @@ export interface WalletConfig {
   strategy: string;
   capital: number;
   riskLimits?: Partial<RiskLimits>;
+  /** ISO-8601 date — ignore all trades before this date (e.g. prior manual trading) */
+  inceptionDate?: string;
 }
 
 export interface EnvironmentConfig {

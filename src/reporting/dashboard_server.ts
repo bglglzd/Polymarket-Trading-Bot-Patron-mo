@@ -9,6 +9,17 @@ import { consoleLog } from './console_log';
 import type { WhaleAPI } from '../whales/whale_api';
 import type { Engine } from '../core/engine';
 import { CopyTradeStrategy } from '../strategies/copy_trading/copy_trade_strategy';
+import {
+  authMiddleware,
+  verifyTelegramAuth,
+  isAdmin,
+  sessionManager,
+  parseCookie,
+  setSessionCookie,
+  clearSessionCookie,
+  getLoginPageHtml,
+  type TelegramAuthData,
+} from './auth';
 
 /* ──────────────────────────────────────────────────────────────
    Strategy catalog — rich metadata used by the Strategies tab
@@ -70,8 +81,20 @@ interface StrategyCatalogEntry {
    ────────────────────────────────────────────────────────────── */
 import type { WalletState, TradeRecord, Position } from '../types';
 
-function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPrices?: Map<string, number>) {
-  const sorted = [...trades].sort((a, b) => a.timestamp - b.timestamp);
+function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPrices?: Map<string, number>, inceptionDate?: string) {
+  const cutoff = inceptionDate ? new Date(inceptionDate).getTime() : 0;
+  const sorted = [...trades].filter((t) => t.timestamp >= cutoff).sort((a, b) => a.timestamp - b.timestamp);
+
+  /* ── Determine which markets have post-inception trades (for position filtering) ── */
+  const postInceptionMarkets = new Set(sorted.map((t) => t.marketId));
+
+  /* ── Filter open positions to only post-inception ── */
+  const filteredPositions = cutoff > 0
+    ? wallet.openPositions.filter((p) => postInceptionMarkets.has(p.marketId))
+    : wallet.openPositions;
+
+  /* ── Compute realized PnL from filtered trades only ── */
+  const filteredRealizedPnl = sorted.reduce((sum, t) => sum + t.realizedPnl, 0);
 
   /* ── Basic stats ── */
   const totalTrades = sorted.length;
@@ -89,16 +112,17 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   const largestWin = wins.length > 0 ? Math.max(...wins.map((t) => t.realizedPnl)) : 0;
   const largestLoss = losses.length > 0 ? Math.min(...losses.map((t) => t.realizedPnl)) : 0;
 
-  /* ── Cumulative PnL timeline ── */
+  /* ── Cumulative PnL timeline (starting from $0 at inception) ── */
   let cumPnl = 0;
+  const startingBalance = wallet.capitalAllocated;
   const pnlTimeline: { ts: number; pnl: number; balance: number }[] = [];
   for (const t of sorted) {
     cumPnl += t.realizedPnl;
-    pnlTimeline.push({ ts: t.timestamp, pnl: round(cumPnl), balance: round(t.balanceAfter) });
+    pnlTimeline.push({ ts: t.timestamp, pnl: round(cumPnl), balance: round(startingBalance + cumPnl) });
   }
 
   /* ── Drawdown calculation ── */
-  let peak = wallet.capitalAllocated;
+  let peak = startingBalance;
   let maxDrawdown = 0;
   let maxDrawdownPct = 0;
   const drawdownTimeline: { ts: number; drawdown: number; drawdownPct: number }[] = [];
@@ -176,6 +200,13 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
   const dailyLossUtilization = wallet.riskLimits.maxDailyLoss > 0 ? dailyLossUsed / wallet.riskLimits.maxDailyLoss : 0;
   const openTradeUtilization = wallet.riskLimits.maxOpenTrades > 0 ? wallet.openPositions.length / wallet.riskLimits.maxOpenTrades : 0;
 
+  /* ── Unrealized PnL from filtered positions only ── */
+  const filteredUnrealizedPnl = filteredPositions.reduce((sum, p) => {
+    const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
+    return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
+  }, 0);
+  const totalPnl = filteredRealizedPnl + filteredUnrealizedPnl;
+
   return {
     wallet: {
       walletId: wallet.walletId,
@@ -183,8 +214,8 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
       strategy: wallet.assignedStrategy,
       capitalAllocated: wallet.capitalAllocated,
       availableBalance: round(wallet.availableBalance),
-      realizedPnl: round(wallet.realizedPnl),
-      openPositions: wallet.openPositions.map((p) => {
+      realizedPnl: round(filteredRealizedPnl),
+      openPositions: filteredPositions.map((p) => {
         const currentPrice = marketPrices?.get(p.marketId) ?? p.avgPrice;
         const uPnl = p.size > 0 && p.avgPrice > 0 ? (currentPrice - p.avgPrice) * p.size : 0;
         return {
@@ -215,18 +246,9 @@ function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPri
       longestWinStreak,
       longestLossStreak,
       currentStreak,
-      unrealizedPnl: round(wallet.openPositions.reduce((sum, p) => {
-        const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-        return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
-      }, 0)),
-      totalPnl: round(wallet.realizedPnl + wallet.openPositions.reduce((sum, p) => {
-        const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-        return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
-      }, 0)),
-      roi: round4((wallet.realizedPnl + wallet.openPositions.reduce((sum, p) => {
-        const cp = marketPrices?.get(p.marketId) ?? p.avgPrice;
-        return sum + (p.size > 0 && p.avgPrice > 0 ? (cp - p.avgPrice) * p.size : 0);
-      }, 0)) / Math.max(1, wallet.capitalAllocated)),
+      unrealizedPnl: round(filteredUnrealizedPnl),
+      totalPnl: round(totalPnl),
+      roi: round4(totalPnl / Math.max(1, wallet.capitalAllocated)),
     },
     risk: {
       capitalUtilization: round4(capitalUtilization),
@@ -672,13 +694,19 @@ function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
+const ALLOWED_ORIGIN = process.env.DASHBOARD_ORIGIN ?? '';
+
 function json(res: http.ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, {
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  });
+  };
+  if (ALLOWED_ORIGIN) {
+    headers['Access-Control-Allow-Origin'] = ALLOWED_ORIGIN;
+    headers['Access-Control-Allow-Methods'] = 'GET,POST,PATCH,DELETE,OPTIONS';
+    headers['Access-Control-Allow-Headers'] = 'Content-Type';
+    headers['Access-Control-Allow-Credentials'] = 'true';
+  }
+  res.writeHead(status, headers);
   res.end(JSON.stringify(body, null, 2));
 }
 
@@ -692,11 +720,17 @@ export class DashboardServer {
   private sseClients: Set<http.ServerResponse> = new Set();
   private sseInterval?: ReturnType<typeof setInterval>;
   private readonly walletDisplayNames = new Map<string, string>();
+  private readonly walletInceptionDates = new Map<string, string>();
 
   constructor(
     private readonly walletManager: WalletManager,
     private readonly port = 3000,
   ) {}
+
+  /** Set inception date for a wallet (ignores all trades before this date) */
+  setInceptionDate(walletId: string, isoDate: string): void {
+    this.walletInceptionDates.set(walletId, isoDate);
+  }
 
   setWhaleApi(api: WhaleAPI): void {
     this.whaleApi = api;
@@ -719,6 +753,62 @@ export class DashboardServer {
       }
     }
     return prices;
+  }
+
+  /**
+   * Build a map of marketId/conditionId → question text,
+   * filtered to only markets referenced in the given payload + trade history.
+   * Without filtering, this would serialize 38K+ entries (~3-5MB) every SSE tick.
+   */
+  private getMarketNames(payload?: any): Record<string, string> {
+    const ids = new Set<string>();
+
+    // Collect IDs from dashboard payload (open positions)
+    if (payload?.wallets) {
+      for (const w of payload.wallets) {
+        for (const p of w.openPositions ?? []) {
+          if (p.marketId) ids.add(p.marketId);
+        }
+      }
+    }
+
+    // Collect IDs from all trade histories
+    for (const [, trades] of this.walletManager.getAllTradeHistories()) {
+      for (const t of trades) {
+        if (t.marketId) ids.add(t.marketId);
+      }
+    }
+
+    if (ids.size === 0 || !this.engine) return {};
+
+    const names: Record<string, string> = {};
+    const stream = this.engine.getStream();
+    const unresolved = new Set<string>();
+
+    // Direct lookup by marketId (O(1) per ID)
+    for (const id of ids) {
+      const m = stream.getMarket(id);
+      if (m?.question) {
+        names[id] = m.question;
+        if (m.conditionId) names[m.conditionId] = m.question;
+      } else {
+        unresolved.add(id);
+      }
+    }
+
+    // Reverse lookup for conditionIds (only iterates if needed)
+    if (unresolved.size > 0) {
+      for (const m of stream.getAllMarkets()) {
+        if (m.conditionId && unresolved.has(m.conditionId) && m.question) {
+          names[m.conditionId] = m.question;
+          names[m.marketId] = m.question;
+          unresolved.delete(m.conditionId);
+          if (unresolved.size === 0) break;
+        }
+      }
+    }
+
+    return names;
   }
 
   /** Get all running CopyTradeStrategy instances from the engine */
@@ -757,16 +847,35 @@ export class DashboardServer {
     });
 
     // Broadcast dashboard data to SSE clients every second
+    let _ssePerfCounter = 0;
     this.sseInterval = setInterval(() => {
       if (this.sseClients.size === 0) return;
+      const t0 = Date.now();
       const payload = buildDashboardPayload(
         this.walletManager.listWallets(),
         this.walletManager.getAllTradeHistories(),
         this.getLiveMarketPrices(),
         this.engine?.getPausedWallets(),
         this.walletDisplayNames,
+        this.walletInceptionDates,
       );
+      const t1 = Date.now();
+      (payload as any).marketNames = this.getMarketNames(payload);
+      const t2 = Date.now();
       const data = `event: dashboard\ndata: ${JSON.stringify(payload)}\n\n`;
+      const t3 = Date.now();
+      // Log every 30th tick (~30s)
+      if (++_ssePerfCounter % 30 === 1) {
+        logger.info({
+          buildMs: t1 - t0,
+          namesMs: t2 - t1,
+          jsonMs: t3 - t2,
+          payloadBytes: data.length,
+          payloadKB: (data.length / 1024).toFixed(1),
+          marketNamesCount: Object.keys((payload as any).marketNames || {}).length,
+          clients: this.sseClients.size,
+        }, 'SSE perf');
+      }
       for (const client of this.sseClients) {
         try {
           client.write(data);
@@ -800,22 +909,100 @@ export class DashboardServer {
     const method = req.method ?? 'GET';
     const path = url.pathname;
 
+    /* ─── Login page ─── */
+    if (path === '/login' && method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(getLoginPageHtml());
+      return;
+    }
+
+    /* ─── Telegram auth callback ─── */
+    if (path === '/auth/telegram/callback' && method === 'GET') {
+      const data: TelegramAuthData = {
+        id: url.searchParams.get('id') ?? '',
+        first_name: url.searchParams.get('first_name') ?? undefined,
+        last_name: url.searchParams.get('last_name') ?? undefined,
+        username: url.searchParams.get('username') ?? undefined,
+        photo_url: url.searchParams.get('photo_url') ?? undefined,
+        auth_date: url.searchParams.get('auth_date') ?? '',
+        hash: url.searchParams.get('hash') ?? '',
+      };
+
+      if (!verifyTelegramAuth(data)) {
+        res.writeHead(302, { Location: '/login?error=invalid' });
+        res.end();
+        return;
+      }
+
+      if (!isAdmin(data.id)) {
+        logger.warn({ telegramId: data.id, username: data.username }, 'Non-admin login attempt');
+        res.writeHead(302, { Location: '/login?error=denied' });
+        res.end();
+        return;
+      }
+
+      const token = sessionManager.create(data.id, data.username ?? data.first_name ?? 'admin');
+      setSessionCookie(res, token);
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
+    }
+
+    /* ─── Logout ─── */
+    if (path === '/auth/logout' && method === 'POST') {
+      const token = parseCookie(req);
+      if (token) sessionManager.destroy(token);
+      clearSessionCookie(res);
+      json(res, 200, { ok: true });
+      return;
+    }
+
+    /* ─── Health check (public) ─── */
+    if (path === '/health' && method === 'GET') {
+      json(res, 200, { status: 'ok', uptime: process.uptime() });
+      return;
+    }
+
+    /* ─── Auth gate — everything below requires a valid session ─── */
+    if (!authMiddleware(req, res)) return;
+
     /* ─── HTML pages ─── */
     if (path === '/' || path === '/dashboard') {
+      const _ht0 = Date.now();
+      const _html = getDashboardHtml();
+      const _ht1 = Date.now();
+      logger.info({ genMs: _ht1 - _ht0, sizeKB: (_html.length / 1024).toFixed(1) }, 'Dashboard HTML served');
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getDashboardHtml());
+      res.end(_html);
       return;
     }
 
     /* ─── JSON: overview data (used by Dashboard tab) ─── */
     if (path === '/api/data' && method === 'GET') {
-      json(res, 200, buildDashboardPayload(
+      const _t0 = Date.now();
+      const dp = buildDashboardPayload(
         this.walletManager.listWallets(),
         this.walletManager.getAllTradeHistories(),
         this.getLiveMarketPrices(),
         this.engine?.getPausedWallets(),
         this.walletDisplayNames,
-      ));
+      );
+      const _t1 = Date.now();
+      (dp as any).marketNames = this.getMarketNames(dp);
+      const _t2 = Date.now();
+      const _jsonStr = JSON.stringify(dp);
+      const _t3 = Date.now();
+      logger.info({
+        buildMs: _t1 - _t0,
+        namesMs: _t2 - _t1,
+        jsonMs: _t3 - _t2,
+        payloadKB: (_jsonStr.length / 1024).toFixed(1),
+        marketNamesCount: Object.keys((dp as any).marketNames || {}).length,
+        wallets: dp.wallets?.length,
+        positions: dp.wallets?.reduce((s: number, w: any) => s + (w.openPositions?.length || 0), 0),
+      }, 'API /api/data perf');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(_jsonStr);
       return;
     }
 
@@ -953,7 +1140,8 @@ export class DashboardServer {
         return;
       }
       const trades = this.walletManager.getTradeHistory(walletId);
-      const detail = buildWalletDetail(walletState, trades, this.getLiveMarketPrices());
+      const inception = this.walletInceptionDates.get(walletId);
+      const detail = buildWalletDetail(walletState, trades, this.getLiveMarketPrices(), inception);
       /* Augment with display name and paused state */
       const walletObj = this.walletManager.getWallet(walletId);
       (detail.wallet as Record<string, unknown>).displayName =
@@ -1287,26 +1475,39 @@ export class DashboardServer {
 
     /* ─── SSE: Real-time dashboard data stream ─── */
     if (path === '/api/stream' && method === 'GET') {
-      res.writeHead(200, {
+      const sseHeaders: Record<string, string> = {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
-      });
+      };
+      if (ALLOWED_ORIGIN) {
+        sseHeaders['Access-Control-Allow-Origin'] = ALLOWED_ORIGIN;
+        sseHeaders['Access-Control-Allow-Credentials'] = 'true';
+      }
+      res.writeHead(200, sseHeaders);
       res.write(':\n\n');  // comment to establish connection
 
       this.sseClients.add(res);
       req.on('close', () => this.sseClients.delete(res));
 
       // Send initial data immediately
-      const payload = buildDashboardPayload(
+      const ssePayload = buildDashboardPayload(
         this.walletManager.listWallets(),
         this.walletManager.getAllTradeHistories(),
         this.getLiveMarketPrices(),
         this.engine?.getPausedWallets(),
         this.walletDisplayNames,
+        this.walletInceptionDates,
       );
-      res.write(`event: dashboard\ndata: ${JSON.stringify(payload)}\n\n`);
+      (ssePayload as any).marketNames = this.getMarketNames(ssePayload);
+      res.write(`event: dashboard\ndata: ${JSON.stringify(ssePayload)}\n\n`);
+      return;
+    }
+
+    /* ─── SPA catch-all: serve dashboard HTML for client-side routes ─── */
+    if (!path.startsWith('/api/')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(getDashboardHtml());
       return;
     }
 
@@ -1590,8 +1791,13 @@ footer{text-align:center;padding:24px;color:var(--muted);font-size:11px;border-t
 .wd-stat .value{font-size:20px;font-weight:700}
 .wd-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:20px}
 .wd-section h3{font-size:15px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.wd-chart{width:100%;height:200px;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden;position:relative}
-.wd-chart svg{width:100%;height:100%}
+.wd-chart-desc{font-size:11px;color:var(--muted);margin:-8px 0 10px 0}
+.wd-chart-wrap{width:100%;height:220px;background:var(--surface2);border-radius:var(--radius-sm);overflow:hidden;position:relative;cursor:crosshair}
+.wd-chart-wrap canvas{width:100%;height:100%;display:block}
+.wd-tooltip{display:none;position:absolute;top:0;left:0;background:rgba(20,20,30,.92);border:1px solid var(--border);border-radius:6px;padding:8px 12px;pointer-events:none;z-index:10;font-size:12px;line-height:1.5;white-space:nowrap;backdrop-filter:blur(6px)}
+.wd-tooltip .tip-date{color:var(--muted);font-size:10px;margin-bottom:2px}
+.wd-tooltip .tip-val{font-size:16px;font-weight:700}
+.wd-tooltip .tip-extra{font-size:11px;color:var(--muted);margin-top:2px}
 .wd-risk-bars{display:flex;flex-direction:column;gap:10px;margin-top:10px}
 .wd-rb{display:flex;align-items:center;gap:10px}
 .wd-rb .lbl{width:140px;font-size:12px;color:var(--muted)}
@@ -1634,6 +1840,18 @@ footer{text-align:center;padding:24px;color:var(--muted);font-size:11px;border-t
 .wd-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
 .wd-tab-panel{display:none}
 .wd-tab-panel.active{display:block}
+/* ═══ Wallet Detail Hero Cards ═══ */
+.wd-hero-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:22px}
+@media(max-width:900px){.wd-hero-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:500px){.wd-hero-grid{grid-template-columns:1fr}}
+.wd-hero{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;text-align:center}
+.wd-hero .label{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:6px}
+.wd-hero .value{font-size:28px;font-weight:800;letter-spacing:-.5px}
+.wd-hero .sub{font-size:11px;color:var(--muted);margin-top:4px}
+/* ═══ Wallet Detail Grouped Stats ═══ */
+.wd-group{margin-bottom:18px}
+.wd-group-title{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent);font-weight:600;margin-bottom:8px;padding-left:2px}
+.wd-group-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
 
 /* ═══ Wallet Settings Form ═══ */
 .ws-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;margin-bottom:20px}
@@ -1737,6 +1955,7 @@ footer{text-align:center;padding:24px;color:var(--muted);font-size:11px;border-t
   <div class="header-right">
     <span class="pulse"></span>
     <span class="header-ts" id="hdr-ts">Loading\u2026</span>
+    <button id="btn-logout" style="background:none;border:1px solid var(--border);color:var(--muted);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:12px;margin-left:8px" title="Sign out">Logout</button>
   </div>
 </div>
 
@@ -2366,17 +2585,54 @@ let currentData = null;
 let strategies = [];
 let walletList = [];
 
-/* ─── Tab switching ─── */
+/* ─── Tab switching with URL routing ─── */
+const VALID_TABS = ['dashboard','markets','wallets','strategies','analytics','whales','console'];
+
+function activateTab(tabName, pushState) {
+  if (!VALID_TABS.includes(tabName)) tabName = 'dashboard';
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  const btn = document.querySelector('[data-tab="'+tabName+'"]');
+  if (btn) btn.classList.add('active');
+  const pane = document.getElementById('pane-' + tabName);
+  if (pane) pane.classList.add('active');
+  if (tabName === 'markets') loadMarkets();
+  if (tabName === 'whales') loadWhales();
+  if (pushState) {
+    const url = tabName === 'dashboard' ? '/' : '/' + tabName;
+    history.pushState({ tab: tabName }, '', url);
+  }
+}
+
 document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('pane-' + btn.dataset.tab).classList.add('active');
-    if(btn.dataset.tab==='markets') loadMarkets();
-    if(btn.dataset.tab==='whales') loadWhales();
-  });
+  btn.addEventListener('click', () => activateTab(btn.dataset.tab, true));
 });
+
+window.addEventListener('popstate', () => {
+  const parts = location.pathname.replace(/^\\//, '').split('/');
+  /* /wallets/{walletId} or /wallets/{walletId}/{tab} */
+  if (parts[0] === 'wallets' && parts[1]) {
+    activateTab('wallets', false);
+    openWalletDetail(decodeURIComponent(parts[1]), parts[2] || 'overview', false);
+    return;
+  }
+  /* Close wallet detail if navigating away */
+  if (walletDetailId) closeWalletDetail(false);
+  const tab = parts[0] || 'dashboard';
+  activateTab(tab, false);
+});
+
+/* Activate tab/wallet from URL on page load */
+(function(){
+  const parts = location.pathname.replace(/^\\//, '').split('/');
+  if (parts[0] === 'wallets' && parts[1]) {
+    activateTab('wallets', false);
+    openWalletDetail(decodeURIComponent(parts[1]), parts[2] || 'overview', false);
+  } else {
+    const tab = parts[0] || 'dashboard';
+    if (tab !== 'dashboard') activateTab(tab, false);
+  }
+})();
 
 /* ─── Helpers ─── */
 const $ = s => document.querySelector(s);
@@ -2384,6 +2640,18 @@ const fmt = (v,d=2) => Number(v).toFixed(d);
 const pct = v => (v*100).toFixed(1)+'%';
 function pnlCls(v){return v>0?'pnl-pos':v<0?'pnl-neg':'pnl-zero'}
 function barCls(r){return r<.6?'bar-ok':r<.85?'bar-warn':'bar-danger'}
+
+/* Market name lookup */
+let _marketNames = {};
+function mktName(id, maxLen) {
+  if (!id) return '?';
+  const name = _marketNames[id];
+  if (!name) return id.length > 24 ? id.slice(0,10) + '\\u2026' + id.slice(-8) : id;
+  maxLen = maxLen || 60;
+  return name.length > maxLen ? name.slice(0, maxLen - 1) + '\\u2026' : name;
+}
+function escMktName(id, maxLen) { return escHtml(mktName(id, maxLen)); }
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
 /* ─── Dashboard Tab ─── */
 function renderSummary(d){
@@ -2413,27 +2681,6 @@ function renderWallets(wl){
     const toggleLabel = isPaused ? '\u25B6 Start' : '\u23F8 Running';
     const dName = w.displayName || w.walletId;
 
-    /* ── Top 10 positions by total PnL ── */
-    let posHtml='';
-    if(w.openPositions.length>0){
-      const sorted=w.openPositions.slice().map(pos=>{
-        const up=pos.unrealizedPnl||0;
-        return {...pos, totalPnl: pos.realizedPnl+up};
-      }).sort((a,b)=>b.totalPnl-a.totalPnl);
-      const top10=sorted.slice(0,10);
-      const showing=top10.length;
-      const total=w.openPositions.length;
-      posHtml='<div class="pos-sec"><div class="pos-title">\uD83D\uDCCA Top Positions'+(total>showing?' <span style="font-size:10px;color:var(--muted);font-weight:400">('+showing+' of '+total+')</span>':'')+'</div>'+
-        '<div class="pos-list">'+top10.map(pos=>{
-          const up=pos.unrealizedPnl||0;
-          const tp=pos.realizedPnl+up;
-          return '<div class="pos-row"><div class="pos-mkt" title="'+pos.marketId+'">'+pos.marketId.slice(0,20)+(pos.marketId.length>20?'…':'')+'</div>'+
-            '<div class="pos-out o-'+pos.outcome+'">'+pos.outcome+'</div>'+
-            '<div class="pos-sz">×'+fmt(pos.size,1)+'</div>'+
-            '<div class="pos-pnl '+pnlCls(tp)+'">$'+fmt(tp)+'</div></div>';
-        }).join('')+'</div></div>';
-    }
-
     return '<div class="w-card" style="cursor:pointer" onclick="openWalletDetail(\\''+w.walletId+'\\')" title="Click for detailed analytics">'+
       '<div class="w-hdr"><div class="w-left"><span class="w-id">'+dName+'</span><span class="w-strat">'+w.strategy+'</span></div><div style="display:flex;align-items:center;gap:8px"><button class="toggle-btn '+toggleCls+'" onclick="event.stopPropagation();toggleWallet(\\''+w.walletId+'\\','+isPaused+')" title="'+(isPaused?'Start':'Pause')+' this wallet"><span class="toggle-dot"></span>'+toggleLabel+'</button><span class="badge badge-'+w.mode+'">'+w.mode+'</span></div></div>'+
       '<div class="w-body"><div class="m-row">'+
@@ -2450,7 +2697,6 @@ function renderWallets(wl){
       '<div class="rb-row"><span class="rb-label">Daily Loss</span><div class="rb-track"><div class="rb-fill '+barCls(lossR)+'" style="width:'+(lossR*100).toFixed(1)+'%"></div></div><span class="rb-val">'+pct(lossR)+'</span></div>'+
       '<div class="rb-row"><span class="rb-label">Open Trades</span><div class="rb-track"><div class="rb-fill '+barCls(trR)+'" style="width:'+(trR*100).toFixed(1)+'%"></div></div><span class="rb-val">'+w.openPositions.length+'/'+w.riskLimits.maxOpenTrades+'</span></div>'+
       '</div></div>'+
-      posHtml+
       '</div></div>';
   }).join('');
 }
@@ -2470,15 +2716,19 @@ let walletDetailId = null;
 let walletDetailInterval = null;
 let wdActiveTab = 'overview';
 
-async function openWalletDetail(walletId){
+async function openWalletDetail(walletId, tab, doPush){
   try{
     const r=await fetch('/api/wallets/'+encodeURIComponent(walletId)+'/detail');
     if(!r.ok){alert('Wallet not found');return}
     const d=await r.json();
     walletDetailId = walletId;
-    wdActiveTab = 'overview';
+    wdActiveTab = tab || 'overview';
     renderWalletDetail(d);
     document.getElementById('wallet-detail-overlay').classList.add('active');
+    if(doPush !== false){
+      const u = '/wallets/'+encodeURIComponent(walletId)+(wdActiveTab !== 'overview' ? '/'+wdActiveTab : '');
+      history.pushState({ wallet: walletId, wdTab: wdActiveTab }, '', u);
+    }
     // Auto-refresh wallet detail every 2s
     if(walletDetailInterval) clearInterval(walletDetailInterval);
     walletDetailInterval = setInterval(async()=>{
@@ -2489,18 +2739,26 @@ async function openWalletDetail(walletId){
     }, 2000);
   }catch(e){console.error(e);alert('Failed to load wallet detail')}
 }
-function closeWalletDetail(){
+function closeWalletDetail(doPush){
   walletDetailId = null;
   if(walletDetailInterval){clearInterval(walletDetailInterval);walletDetailInterval=null}
   document.getElementById('wallet-detail-overlay').classList.remove('active');
+  if(doPush !== false){
+    history.pushState({ tab: 'wallets' }, '', '/wallets');
+  }
 }
 
 let lastWalletDetailData = null;
+let _chartFp = '';
 
 function switchWdTab(tab){
   wdActiveTab = tab;
   document.querySelectorAll('.wd-tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===tab));
   document.querySelectorAll('.wd-tab-panel').forEach(p=>p.classList.toggle('active',p.id==='wdp-'+tab));
+  if(walletDetailId){
+    const u = '/wallets/'+encodeURIComponent(walletDetailId)+(tab !== 'overview' ? '/'+tab : '');
+    history.replaceState({ wallet: walletDetailId, wdTab: tab }, '', u);
+  }
 }
 
 function renderWalletDetail(d){
@@ -2509,6 +2767,16 @@ function renderWalletDetail(d){
   const dName = w.displayName || w.walletId;
   const isPaused = w.paused || false;
   document.getElementById('wd-title').textContent=dName+' \u2014 '+w.strategy+' ('+w.mode+')';
+
+  /* ── Store chart data for interactive canvas charts ── */
+  var _pnlArr=d.pnlTimeline.map(p=>p.pnl), _ddArr=d.drawdownTimeline.map(p=>-p.drawdown);
+  var _newChartFp=_pnlArr.length+':'+(_pnlArr[_pnlArr.length-1]||0)+':'+_ddArr.length+':'+(_ddArr[_ddArr.length-1]||0);
+  var _chartChanged=(_newChartFp!==_chartFp);
+  _chartFp=_newChartFp;
+  window.__wdCharts = {
+    pnl: { data: _pnlArr, ts: d.pnlTimeline.map(p=>p.ts), bal: d.pnlTimeline.map(p=>p.balance) },
+    dd: { data: _ddArr, ts: d.drawdownTimeline.map(p=>p.ts), pct: d.drawdownTimeline.map(p=>p.drawdownPct) },
+  };
 
   let html='';
 
@@ -2532,40 +2800,49 @@ function renderWalletDetail(d){
   /* ═══ TAB: Overview ═══ */
   html+='<div id="wdp-overview" class="wd-tab-panel'+(wdActiveTab==='overview'?' active':'')+'">';
 
-  /* Summary stats */
-  html+='<div class="wd-summary">';
+  /* Hero cards — 3 key metrics at a glance */
   const uPnl = w.openPositions.reduce((s,p) => s + (p.unrealizedPnl||0), 0);
   const tPnl = w.realizedPnl + uPnl;
-  const stats=[
-    ['Capital','$'+fmt(w.capitalAllocated,0),''],
-    ['Available','$'+fmt(w.availableBalance),''],
-    ['Realized PnL','$'+fmt(w.realizedPnl),pnlCls(w.realizedPnl)],
-    ['Unrealized PnL','$'+fmt(uPnl),pnlCls(uPnl)],
-    ['Total PnL','$'+fmt(tPnl),pnlCls(tPnl)],
-    ['ROI',pct(tPnl/Math.max(1,w.capitalAllocated)),pnlCls(tPnl)],
-    ['Total Trades',s.totalTrades,''],
-    ['Buys / Sells',s.buyTrades+' / '+s.sellTrades,''],
-    ['Closed Trades',s.closedTrades,''],
-    ['Win Rate',s.closedTrades>0?pct(s.winRate):'N/A',s.winRate>=0.5?'pnl-pos':'pnl-neg'],
-    ['Avg Win','$'+fmt(s.avgWin),'pnl-pos'],
-    ['Avg Loss','$'+fmt(Math.abs(s.avgLoss)),'pnl-neg'],
-    ['Profit Factor',s.profitFactor==='Infinity'?'\\u221E':fmt(s.profitFactor,1),''],
-    ['Max Drawdown','$'+fmt(s.maxDrawdown)+' ('+pct(s.maxDrawdownPct)+')','pnl-neg'],
-    ['Largest Win','$'+fmt(s.largestWin),'pnl-pos'],
-    ['Largest Loss','$'+fmt(Math.abs(s.largestLoss)),'pnl-neg'],
-    ['Win Streak',s.longestWinStreak,''],
-    ['Loss Streak',s.longestLossStreak,''],
-    ['Current Streak',(s.currentStreak>0?'+':'')+s.currentStreak,s.currentStreak>0?'pnl-pos':s.currentStreak<0?'pnl-neg':''],
-  ];
-  for(const[label,value,cls] of stats){
-    html+='<div class="wd-stat"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+value+'</div></div>';
-  }
-  html+='</div>';
+  const roi = tPnl/Math.max(1,w.capitalAllocated);
+  function mkSt(label,value,cls){ return '<div class="wd-stat"><div class="label">'+label+'</div><div class="value '+(cls||'')+'">'+value+'</div></div>'; }
 
-  /* Charts row */
+  html+='<div class="wd-hero-grid">'+
+    '<div class="wd-hero"><div class="label">Total PnL</div><div class="value '+pnlCls(tPnl)+'">$'+fmt(tPnl)+'</div><div class="sub">Realized $'+fmt(w.realizedPnl)+' + Unrealized $'+fmt(uPnl)+'</div></div>'+
+    '<div class="wd-hero"><div class="label">ROI</div><div class="value '+pnlCls(roi)+'">'+pct(roi)+'</div><div class="sub">on $'+fmt(w.capitalAllocated,0)+' capital</div></div>'+
+    '<div class="wd-hero"><div class="label">Win Rate</div><div class="value '+(s.winRate>=0.5?'pnl-pos':s.closedTrades>0?'pnl-neg':'')+'">'+(s.closedTrades>0?pct(s.winRate):'N/A')+'</div><div class="sub">'+s.closedTrades+' closed of '+s.totalTrades+' total</div></div>'+
+    '</div>';
+
+  /* Balance group */
+  html+='<div class="wd-group"><div class="wd-group-title">Balance</div><div class="wd-group-grid">'+
+    mkSt('Capital','$'+fmt(w.capitalAllocated,0),'')+
+    mkSt('Available','$'+fmt(w.availableBalance),'')+
+    mkSt('Realized PnL','$'+fmt(w.realizedPnl),pnlCls(w.realizedPnl))+
+    mkSt('Unrealized PnL','$'+fmt(uPnl),pnlCls(uPnl))+
+    '</div></div>';
+
+  /* Trading performance group */
+  html+='<div class="wd-group"><div class="wd-group-title">Trading Performance</div><div class="wd-group-grid">'+
+    mkSt('Total Trades',s.totalTrades,'')+
+    mkSt('Buys / Sells',s.buyTrades+' / '+s.sellTrades,'')+
+    mkSt('Profit Factor',s.profitFactor==='Infinity'?'\\u221E':fmt(s.profitFactor,1),'')+
+    mkSt('Avg Win','$'+fmt(s.avgWin),'pnl-pos')+
+    mkSt('Avg Loss','$'+fmt(Math.abs(s.avgLoss)),'pnl-neg')+
+    '</div></div>';
+
+  /* Risk & streaks group */
+  html+='<div class="wd-group"><div class="wd-group-title">Risk & Streaks</div><div class="wd-group-grid">'+
+    mkSt('Max Drawdown','$'+fmt(s.maxDrawdown)+' ('+pct(s.maxDrawdownPct)+')','pnl-neg')+
+    mkSt('Largest Win','$'+fmt(s.largestWin),'pnl-pos')+
+    mkSt('Largest Loss','$'+fmt(Math.abs(s.largestLoss)),'pnl-neg')+
+    mkSt('Win Streak',s.longestWinStreak,'')+
+    mkSt('Loss Streak',s.longestLossStreak,'')+
+    mkSt('Current Streak',(s.currentStreak>0?'+':'')+s.currentStreak,s.currentStreak>0?'pnl-pos':s.currentStreak<0?'pnl-neg':'')+
+    '</div></div>';
+
+  /* Charts — interactive canvas with hover tooltip */
   html+='<div class="wd-2col">';
-  html+='<div class="wd-section"><h3>\uD83D\uDCC8 Cumulative PnL</h3><div class="wd-chart" id="wd-pnl-chart"></div></div>';
-  html+='<div class="wd-section"><h3>\uD83D\uDCC9 Drawdown</h3><div class="wd-chart" id="wd-dd-chart"></div></div>';
+  html+='<div class="wd-section"><h3>Cumulative PnL</h3><div class="wd-chart-desc">Total profit/loss over time across all trades</div><div class="wd-chart-wrap" id="chart-pnl-wrap"><canvas id="chart-pnl"></canvas><div class="wd-tooltip" id="tip-pnl"></div></div></div>';
+  html+='<div class="wd-section"><h3>Drawdown</h3><div class="wd-chart-desc">Peak-to-trough decline from highest balance</div><div class="wd-chart-wrap" id="chart-dd-wrap"><canvas id="chart-dd"></canvas><div class="wd-tooltip" id="tip-dd"></div></div></div>';
   html+='</div>';
 
   /* Risk utilization */
@@ -2588,12 +2865,12 @@ function renderWalletDetail(d){
   /* Open positions (clickable) */
   if(w.openPositions.length>0){
     html+='<div class="wd-section"><h3>\uD83D\uDCCA Open Positions ('+w.openPositions.length+') <span style="font-size:11px;color:var(--accent);font-weight:400;margin-left:8px">Click a row for details</span></h3>';
-    html+='<table class="wd-mkt-table"><thead><tr><th>Market ID</th><th>Outcome</th><th>Size</th><th>Avg Price</th><th>Realized PnL</th><th>Unrealized PnL</th><th>Total PnL</th></tr></thead><tbody>';
+    html+='<table class="wd-mkt-table"><thead><tr><th>Market</th><th>Outcome</th><th>Size</th><th>Avg Price</th><th>Realized PnL</th><th>Unrealized PnL</th><th>Total PnL</th></tr></thead><tbody>';
     for(let i=0;i<w.openPositions.length;i++){
       const p=w.openPositions[i];
       const upnl = p.unrealizedPnl||0;
       const tpnl = p.realizedPnl + upnl;
-      html+='<tr class="clickable-row" onclick="drillPosition('+i+')"><td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis" title="'+p.marketId+'">'+p.marketId+'</td><td class="o-'+p.outcome+'">'+p.outcome+'</td><td>'+fmt(p.size,1)+'</td><td>$'+fmt(p.avgPrice,4)+'</td><td class="'+pnlCls(p.realizedPnl)+'">$'+fmt(p.realizedPnl)+'</td><td class="'+pnlCls(upnl)+'">$'+fmt(upnl)+'</td><td class="'+pnlCls(tpnl)+'">$'+fmt(tpnl)+'</td></tr>';
+      html+='<tr class="clickable-row" onclick="drillPosition('+i+')"><td style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.3" title="'+escHtml(p.marketId)+'">'+escMktName(p.marketId,50)+'</td><td class="o-'+p.outcome+'">'+p.outcome+'</td><td>'+fmt(p.size,1)+'</td><td>$'+fmt(p.avgPrice,4)+'</td><td class="'+pnlCls(p.realizedPnl)+'">$'+fmt(p.realizedPnl)+'</td><td class="'+pnlCls(upnl)+'">$'+fmt(upnl)+'</td><td class="'+pnlCls(tpnl)+'">$'+fmt(tpnl)+'</td></tr>';
     }
     html+='</tbody></table></div>';
   }else{
@@ -2606,7 +2883,7 @@ function renderWalletDetail(d){
     html+='<table class="wd-mkt-table"><thead><tr><th>Market</th><th>Outcome</th><th>Trades</th><th>Buy Vol</th><th>Sell Vol</th><th>Avg Entry</th><th>Avg Exit</th><th>PnL</th></tr></thead><tbody>';
     for(let i=0;i<d.marketBreakdown.length;i++){
       const m=d.marketBreakdown[i];
-      html+='<tr class="clickable-row" onclick="drillMarket('+i+')"><td style="font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis">'+m.marketId+'</td><td class="o-'+m.outcome+'">'+m.outcome+'</td><td>'+m.trades+'</td><td>$'+fmt(m.buyVolume)+'</td><td>$'+fmt(m.sellVolume)+'</td><td>$'+fmt(m.avgEntryPrice,4)+'</td><td>$'+fmt(m.avgExitPrice,4)+'</td><td class="'+pnlCls(m.realizedPnl)+'">$'+fmt(m.realizedPnl)+'</td></tr>';
+      html+='<tr class="clickable-row" onclick="drillMarket('+i+')"><td style="font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.3" title="'+escHtml(m.marketId)+'">'+escMktName(m.marketId,50)+'</td><td class="o-'+m.outcome+'">'+m.outcome+'</td><td>'+m.trades+'</td><td>$'+fmt(m.buyVolume)+'</td><td>$'+fmt(m.sellVolume)+'</td><td>$'+fmt(m.avgEntryPrice,4)+'</td><td>$'+fmt(m.avgExitPrice,4)+'</td><td class="'+pnlCls(m.realizedPnl)+'">$'+fmt(m.realizedPnl)+'</td></tr>';
     }
     html+='</tbody></table></div>';
   }
@@ -2621,7 +2898,7 @@ function renderWalletDetail(d){
     for(let i=0;i<reversed.length;i++){
       const t=reversed[i];
       const ts=new Date(t.timestamp).toLocaleString();
-      html+='<tr class="clickable-row" onclick="drillTrade('+i+')"><td style="font-size:10px;white-space:nowrap">'+ts+'</td><td style="font-size:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis" title="'+t.marketId+'">'+t.marketId+'</td><td style="font-weight:700;color:'+(t.side==='BUY'?'var(--green)':'var(--red)')+'">'+t.side+'</td><td class="o-'+t.outcome+'">'+t.outcome+'</td><td>$'+fmt(t.price,4)+'</td><td>'+fmt(t.size,1)+'</td><td>$'+fmt(t.cost)+'</td><td class="'+pnlCls(t.realizedPnl)+'">$'+fmt(t.realizedPnl)+'</td><td class="'+pnlCls(t.cumulativePnl)+'">$'+fmt(t.cumulativePnl)+'</td><td>$'+fmt(t.balanceAfter)+'</td></tr>';
+      html+='<tr class="clickable-row" onclick="drillTrade('+i+')"><td style="font-size:10px;white-space:nowrap">'+ts+'</td><td style="font-size:11px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:normal;line-height:1.3" title="'+escHtml(t.marketId)+'">'+escMktName(t.marketId,45)+'</td><td style="font-weight:700;color:'+(t.side==='BUY'?'var(--green)':'var(--red)')+'">'+t.side+'</td><td class="o-'+t.outcome+'">'+t.outcome+'</td><td>$'+fmt(t.price,4)+'</td><td>'+fmt(t.size,1)+'</td><td>$'+fmt(t.cost)+'</td><td class="'+pnlCls(t.realizedPnl)+'">$'+fmt(t.realizedPnl)+'</td><td class="'+pnlCls(t.cumulativePnl)+'">$'+fmt(t.cumulativePnl)+'</td><td>$'+fmt(t.balanceAfter)+'</td></tr>';
     }
     html+='</tbody></table></div>';
   }else{
@@ -2676,23 +2953,26 @@ function renderWalletDetail(d){
 
   html+='</div>'; /* /settings */
 
-  document.getElementById('wd-content').innerHTML=html;
-
-  /* ── Render SVG charts (only if overview tab is active) ── */
-  if(wdActiveTab==='overview'){
-    if(d.pnlTimeline.length>1){
-      renderSvgLine('wd-pnl-chart',d.pnlTimeline.map(p=>p.pnl),'PnL',true);
-    }else{
-      const el=document.getElementById('wd-pnl-chart');
-      if(el) el.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">No trade data yet</div>';
+  requestAnimationFrame(()=>{
+    var el=document.getElementById('wd-content');
+    if(wdActiveTab==='overview' && !_chartChanged && el.querySelector('#chart-pnl')){
+      /* Charts unchanged — update everything EXCEPT the chart wrappers to preserve interactivity */
+      var tmpDiv=document.createElement('div');
+      tmpDiv.innerHTML=html;
+      /* Update hero, balance, performance, risk, streaks sections — but leave chart canvases alone */
+      ['wd-status-bar','wd-hero-grid'].forEach(function(){});
+      /* Selective update: replace non-chart sections by class */
+      var oldNodes=el.querySelectorAll('.wd-hero-grid,.wd-group,.wd-risk-bars,.wd-status-bar,.wd-tabs');
+      var newNodes=tmpDiv.querySelectorAll('.wd-hero-grid,.wd-group,.wd-risk-bars,.wd-status-bar,.wd-tabs');
+      for(var _i=0;_i<oldNodes.length&&_i<newNodes.length;_i++){
+        if(oldNodes[_i].innerHTML!==newNodes[_i].innerHTML) oldNodes[_i].innerHTML=newNodes[_i].innerHTML;
+      }
+    } else {
+      el.innerHTML=html;
+      /* Initialize interactive charts after DOM update */
+      if(wdActiveTab === 'overview' && window.__wdCharts) initWdCharts();
     }
-    if(d.drawdownTimeline.length>1){
-      renderSvgLine('wd-dd-chart',d.drawdownTimeline.map(p=>-p.drawdown),'Drawdown',true);
-    }else{
-      const el=document.getElementById('wd-dd-chart');
-      if(el) el.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:12px">No trade data yet</div>';
-    }
-  }
+  });
 }
 
 /* ─── Settings save functions ─── */
@@ -2753,46 +3033,180 @@ function showWsMsg(id,type,msg){
   setTimeout(()=>{el.style.display='none'},4000);
 }
 
-function renderSvgLine(containerId,data,label,showZero){
-  const el=document.getElementById(containerId);
-  if(!el||data.length<2)return;
-  const W=el.clientWidth||600,H=el.clientHeight||200;
-  const pad={t:20,r:20,b:25,l:55};
-  const w=W-pad.l-pad.r,h=H-pad.t-pad.b;
-  let mn=Math.min(...data),mx=Math.max(...data);
-  if(showZero){mn=Math.min(mn,0);mx=Math.max(mx,0)}
+/* ─── Interactive Canvas Chart System ─── */
+function initWdCharts(){
+  const cd=window.__wdCharts;
+  if(!cd) return;
+  if(cd.pnl.data.length>1) initCanvas('chart-pnl','tip-pnl',cd.pnl.data,cd.pnl.ts,{showZero:true,prefix:'$',label:'PnL',extra:cd.pnl.bal,extraLabel:'Balance',posColor:'#00d68f',negColor:'#ff4d6a'});
+  else emptyChart('chart-pnl-wrap','No PnL data yet — trades will appear here');
+  if(cd.dd.data.length>1) initCanvas('chart-dd','tip-dd',cd.dd.data,cd.dd.ts,{showZero:true,prefix:'$',label:'Drawdown',extra:cd.dd.pct,extraLabel:'Drawdown %',extraFmt:function(v){return (v*100).toFixed(1)+'%'},posColor:'#00d68f',negColor:'#ff4d6a',alwaysNeg:true});
+  else emptyChart('chart-dd-wrap','No drawdown data yet');
+}
+
+function emptyChart(wrapId,msg){
+  var w=document.getElementById(wrapId);
+  if(w) w.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted);font-size:13px">'+msg+'</div>';
+}
+
+function initCanvas(canvasId,tipId,data,timestamps,opts){
+  var canvas=document.getElementById(canvasId);
+  var tip=document.getElementById(tipId);
+  if(!canvas||!tip) return;
+  var wrap=canvas.parentElement;
+  var dpr=window.devicePixelRatio||1;
+  var W=wrap.clientWidth, H=wrap.clientHeight;
+  canvas.width=W*dpr; canvas.height=H*dpr;
+  canvas.style.width=W+'px'; canvas.style.height=H+'px';
+  var ctx=canvas.getContext('2d');
+  ctx.scale(dpr,dpr);
+
+  var pad={t:24,r:16,b:32,l:56};
+  var cw=W-pad.l-pad.r, ch=H-pad.t-pad.b;
+  var mn=Math.min.apply(null,data), mx=Math.max.apply(null,data);
+  if(opts.showZero){mn=Math.min(mn,0);mx=Math.max(mx,0)}
   if(mn===mx){mn-=1;mx+=1}
-  const xScale=i=>pad.l+(i/(data.length-1))*w;
-  const yScale=v=>pad.t+h-(((v-mn)/(mx-mn))*h);
-  const pts=data.map((v,i)=>xScale(i)+','+yScale(v)).join(' ');
-  const posColor='#00d68f',negColor='#ff4d6a';
-  const lastVal=data[data.length-1];
-  const color=lastVal>=0?posColor:negColor;
-  let svg='<svg viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg">';
-  /* Grid lines */
-  const steps=4;
-  for(let i=0;i<=steps;i++){
-    const v=mn+(mx-mn)*(i/steps);
-    const y=yScale(v);
-    svg+='<line x1="'+pad.l+'" y1="'+y+'" x2="'+(W-pad.r)+'" y2="'+y+'" stroke="rgba(255,255,255,0.05)" />';
-    svg+='<text x="'+(pad.l-8)+'" y="'+(y+4)+'" fill="rgba(255,255,255,0.3)" font-size="9" text-anchor="end">$'+Number(v).toFixed(2)+'</text>';
+  /* Add 5% padding to range */
+  var range=mx-mn;
+  mn-=range*0.05; mx+=range*0.05;
+
+  function xOf(i){return pad.l+(i/(data.length-1))*cw}
+  function yOf(v){return pad.t+ch-((v-mn)/(mx-mn))*ch}
+  function iOfX(x){return Math.max(0,Math.min(data.length-1,Math.round((x-pad.l)/cw*(data.length-1))))}
+
+  var posCol=opts.posColor, negCol=opts.negColor;
+
+  function draw(hoverIdx){
+    ctx.clearRect(0,0,W,H);
+
+    /* Grid lines + Y labels */
+    ctx.textAlign='right'; ctx.textBaseline='middle'; ctx.font='10px -apple-system,system-ui,sans-serif';
+    var steps=5;
+    for(var i=0;i<=steps;i++){
+      var v=mn+(mx-mn)*(i/steps);
+      var y=yOf(v);
+      ctx.strokeStyle='rgba(255,255,255,0.06)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
+      ctx.fillStyle='rgba(255,255,255,0.35)';
+      ctx.fillText(opts.prefix+v.toFixed(2),pad.l-6,y);
+    }
+
+    /* Zero line */
+    if(opts.showZero && mn<0 && mx>0){
+      var zy=yOf(0);
+      ctx.save(); ctx.setLineDash([4,3]); ctx.strokeStyle='rgba(255,255,255,0.2)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(pad.l,zy); ctx.lineTo(W-pad.r,zy); ctx.stroke(); ctx.restore();
+      /* Zero label */
+      ctx.fillStyle='rgba(255,255,255,0.5)'; ctx.textAlign='right';
+      ctx.fillText('$0',pad.l-6,zy);
+    }
+
+    /* X axis labels */
+    if(timestamps&&timestamps.length>1){
+      ctx.textAlign='center'; ctx.textBaseline='top';
+      ctx.fillStyle='rgba(255,255,255,0.3)'; ctx.font='10px -apple-system,system-ui,sans-serif';
+      var tRange=timestamps[timestamps.length-1]-timestamps[0];
+      var lc=Math.min(6,data.length);
+      for(var j=0;j<lc;j++){
+        var idx=Math.round(j*(data.length-1)/(lc-1));
+        var x=xOf(idx);
+        var dt=new Date(timestamps[idx]);
+        var lbl=tRange<86400000?dt.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):dt.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+        ctx.fillText(lbl,x,H-14);
+      }
+    }
+
+    /* Gradient fill area */
+    var lastVal=data[data.length-1];
+    var mainCol=opts.alwaysNeg?negCol:(lastVal>=0?posCol:negCol);
+    var grad=ctx.createLinearGradient(0,pad.t,0,pad.t+ch);
+    grad.addColorStop(0,mainCol.replace(')',',0.18)').replace('rgb','rgba'));
+    grad.addColorStop(1,mainCol.replace(')',',0.01)').replace('rgb','rgba'));
+    /* For hex colors */
+    var r2=parseInt(mainCol.slice(1,3),16),g2=parseInt(mainCol.slice(3,5),16),b2=parseInt(mainCol.slice(5,7),16);
+    grad=ctx.createLinearGradient(0,pad.t,0,pad.t+ch);
+    grad.addColorStop(0,'rgba('+r2+','+g2+','+b2+',0.15)');
+    grad.addColorStop(1,'rgba('+r2+','+g2+','+b2+',0.02)');
+    var zeroY=(opts.showZero&&mn<0&&mx>0)?yOf(0):(pad.t+ch);
+    ctx.beginPath();
+    ctx.moveTo(xOf(0),zeroY);
+    for(var k=0;k<data.length;k++) ctx.lineTo(xOf(k),yOf(data[k]));
+    ctx.lineTo(xOf(data.length-1),zeroY);
+    ctx.closePath();
+    ctx.fillStyle=grad; ctx.fill();
+
+    /* Main line */
+    ctx.beginPath();
+    ctx.moveTo(xOf(0),yOf(data[0]));
+    for(var k=1;k<data.length;k++) ctx.lineTo(xOf(k),yOf(data[k]));
+    ctx.strokeStyle=mainCol; ctx.lineWidth=2; ctx.lineJoin='round'; ctx.stroke();
+
+    /* End-value dot */
+    ctx.beginPath(); ctx.arc(xOf(data.length-1),yOf(lastVal),4,0,Math.PI*2);
+    ctx.fillStyle=mainCol; ctx.fill();
+
+    /* End-value label */
+    ctx.textAlign='left'; ctx.textBaseline='middle';
+    ctx.fillStyle=mainCol; ctx.font='bold 12px -apple-system,system-ui,sans-serif';
+    var endX=xOf(data.length-1);
+    if(endX+60>W-pad.r){ctx.textAlign='right';endX-=8}else{endX+=8}
+    ctx.fillText(opts.prefix+lastVal.toFixed(2),endX,yOf(lastVal));
+
+    /* Hover crosshair + dot */
+    if(hoverIdx!==null&&hoverIdx>=0&&hoverIdx<data.length){
+      var hx=xOf(hoverIdx), hy=yOf(data[hoverIdx]);
+      /* Vertical line */
+      ctx.save(); ctx.setLineDash([3,3]); ctx.strokeStyle='rgba(255,255,255,0.25)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(hx,pad.t); ctx.lineTo(hx,pad.t+ch); ctx.stroke(); ctx.restore();
+      /* Horizontal line */
+      ctx.save(); ctx.setLineDash([3,3]); ctx.strokeStyle='rgba(255,255,255,0.15)'; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.moveTo(pad.l,hy); ctx.lineTo(W-pad.r,hy); ctx.stroke(); ctx.restore();
+      /* Dot */
+      ctx.beginPath(); ctx.arc(hx,hy,5,0,Math.PI*2);
+      ctx.fillStyle='#fff'; ctx.fill();
+      ctx.beginPath(); ctx.arc(hx,hy,3,0,Math.PI*2);
+      ctx.fillStyle=mainCol; ctx.fill();
+    }
   }
-  /* Zero line */
-  if(showZero&&mn<0&&mx>0){
-    const zy=yScale(0);
-    svg+='<line x1="'+pad.l+'" y1="'+zy+'" x2="'+(W-pad.r)+'" y2="'+zy+'" stroke="rgba(255,255,255,0.15)" stroke-dasharray="4,3" />';
-  }
-  /* Area fill */
-  const areaBase=showZero&&mn<0&&mx>0?yScale(0):(pad.t+h);
-  svg+='<polygon points="'+xScale(0)+','+areaBase+' '+pts+' '+xScale(data.length-1)+','+areaBase+'" fill="'+color+'" opacity="0.08" />';
-  /* Line */
-  svg+='<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="2" stroke-linejoin="round" />';
-  /* End dot */
-  svg+='<circle cx="'+xScale(data.length-1)+'" cy="'+yScale(lastVal)+'" r="4" fill="'+color+'" />';
-  /* Label */
-  svg+='<text x="'+pad.l+'" y="'+(H-4)+'" fill="rgba(255,255,255,0.3)" font-size="9">'+label+' ('+data.length+' points)</text>';
-  svg+='</svg>';
-  el.innerHTML=svg;
+
+  /* Initial draw */
+  draw(null);
+
+  /* Mouse interaction */
+  var currentIdx=null;
+  wrap.addEventListener('mousemove',function(e){
+    var rect=canvas.getBoundingClientRect();
+    var mx2=e.clientX-rect.left;
+    var my2=e.clientY-rect.top;
+    var idx=iOfX(mx2);
+    if(idx===currentIdx) return;
+    currentIdx=idx;
+    draw(idx);
+
+    /* Show tooltip */
+    var dt=timestamps?new Date(timestamps[idx]):null;
+    var dateStr=dt?dt.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})+' '+dt.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}):'Point '+(idx+1);
+    var val=data[idx];
+    var valCol=opts.alwaysNeg?negCol:(val>=0?posCol:negCol);
+    var extraHtml='';
+    if(opts.extra&&opts.extra[idx]!==undefined){
+      var ev=opts.extraFmt?opts.extraFmt(opts.extra[idx]):opts.prefix+Number(opts.extra[idx]).toFixed(2);
+      extraHtml='<div class="tip-extra">'+opts.extraLabel+': '+ev+'</div>';
+    }
+    tip.innerHTML='<div class="tip-date">'+dateStr+'</div><div class="tip-val" style="color:'+valCol+'">'+opts.prefix+val.toFixed(2)+'</div>'+extraHtml;
+    tip.style.display='block';
+    /* Position tooltip — flip if near edge */
+    var tx=mx2+16, ty=my2-10;
+    if(tx+tip.offsetWidth>W-10) tx=mx2-tip.offsetWidth-16;
+    if(ty<4) ty=4;
+    if(ty+tip.offsetHeight>H-4) ty=H-tip.offsetHeight-4;
+    tip.style.left=tx+'px'; tip.style.top=ty+'px';
+  });
+
+  wrap.addEventListener('mouseleave',function(){
+    currentIdx=null;
+    draw(null);
+    tip.style.display='none';
+  });
 }
 
 /* ─── Drill-Down Functions ─── */
@@ -2828,7 +3242,7 @@ function drillPosition(idx){
   const mkt=lastWalletDetailData.marketBreakdown.find(m=>m.marketId===p.marketId);
 
   let h='<div class="wd-drill-title">\uD83D\uDCCA Position Detail</div>';
-  h+='<div class="wd-drill-subtitle">'+p.marketId+'</div>';
+  h+='<div class="wd-drill-subtitle">'+escMktName(p.marketId,80)+'</div>';
 
   h+='<div class="wd-drill-stats">';
   h+='<div class="wd-drill-stat"><div class="label">Outcome</div><div class="value o-'+p.outcome+'">'+p.outcome+'</div></div>';
@@ -2885,7 +3299,7 @@ function drillMarket(idx){
   const openPos=lastWalletDetailData.wallet.openPositions.find(p=>p.marketId===m.marketId);
 
   let h='<div class="wd-drill-title">\uD83C\uDFAF Market Breakdown Detail</div>';
-  h+='<div class="wd-drill-subtitle">'+m.marketId+'</div>';
+  h+='<div class="wd-drill-subtitle">'+escMktName(m.marketId,80)+'</div>';
 
   h+='<div class="wd-drill-stats">';
   h+='<div class="wd-drill-stat"><div class="label">Outcome</div><div class="value o-'+m.outcome+'">'+m.outcome+'</div></div>';
@@ -2942,7 +3356,7 @@ function drillTrade(reversedIdx){
   const mktBreakdown=lastWalletDetailData.marketBreakdown.find(m=>m.marketId===t.marketId);
 
   let h='<div class="wd-drill-title">\uD83D\uDCDD Trade Detail</div>';
-  h+='<div class="wd-drill-subtitle">'+t.marketId+'</div>';
+  h+='<div class="wd-drill-subtitle">'+escMktName(t.marketId,80)+'</div>';
 
   h+='<div class="wd-drill-stats">';
   h+='<div class="wd-drill-stat"><div class="label">Time</div><div class="value" style="font-size:13px">'+ts+'</div></div>';
@@ -3331,10 +3745,7 @@ async function removeWhale(address){
 
 function useStrategy(stratId){
   /* Switch to wallets tab and pre-fill the strategy */
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
-  document.querySelector('[data-tab="wallets"]').classList.add('active');
-  document.getElementById('pane-wallets').classList.add('active');
+  activateTab('wallets', true);
   document.getElementById('cw-strategy').value=stratId;
   document.getElementById('cw-id').focus();
 }
@@ -3473,7 +3884,7 @@ function renderAnalytics(d){
     return '<tr>'+
       '<td>'+(i+1)+'</td>'+
       '<td>'+time+'</td>'+
-      '<td>'+t.marketId+'</td>'+
+      '<td style="max-width:200px;white-space:normal;line-height:1.3" title="'+escHtml(t.marketId)+'">'+escMktName(t.marketId,45)+'</td>'+
       '<td><span style="color:'+(t.side==='BUY'?'var(--green)':'var(--red)')+'">'+t.side+'</span></td>'+
       '<td class="o-'+t.outcome+'">'+t.outcome+'</td>'+
       '<td>$'+fmt(t.price,4)+'</td>'+
@@ -3624,7 +4035,7 @@ async function showWhaleDetail(id){
       const time=new Date(t.ts).toLocaleString();
       return '<tr>'+
         '<td style="font-size:11px">'+time+'</td>'+
-        '<td style="font-size:11px">'+t.marketId.slice(0,12)+'…</td>'+
+        '<td style="font-size:11px;max-width:180px;white-space:normal;line-height:1.3" title="'+escHtml(t.marketId)+'">'+escMktName(t.marketId,35)+'</td>'+
         '<td style="color:'+(t.side==='BUY'?'var(--green)':'var(--red)')+'">'+t.side+'</td>'+
         '<td>$'+fmt(t.price,3)+'</td>'+
         '<td>'+fmt(t.size,1)+'</td>'+
@@ -4013,7 +4424,7 @@ async function loadClusterSignals(){
     if(arr.length===0){tbody.innerHTML='<tr><td colspan="8" class="empty">No active cluster signals. Signals appear when multiple whales trade the same market.</td></tr>';return}
     tbody.innerHTML=arr.sort((a,b)=>b.confidence-a.confidence).map(s=>{
       const confCls=s.confidence>=0.7?'pnl-pos':s.confidence>=0.4?'pnl-zero':'pnl-neg';
-      const mkt=s.marketId?(s.marketId.length>16?s.marketId.slice(0,8)+'…'+s.marketId.slice(-6):s.marketId):'?';
+      const mkt=s.marketId?escMktName(s.marketId,35):'?';
       const sideCls=s.side==='BUY'?'color:var(--green)':'color:var(--red)';
       const ttlMin=s.ttlMs?Math.round(s.ttlMs/60000):0;
       const created=s.createdAt?new Date(s.createdAt).toLocaleTimeString():'?';
@@ -4507,6 +4918,7 @@ async function fetchDashboardData(){
   try{
     const r = await fetch('/api/data');
     const d = await r.json();
+    if (d.marketNames) _marketNames = d.marketNames;
     currentData = d;
     $('#hdr-ts').textContent = new Date(d.generatedAt).toLocaleString();
     renderSummary(d);
@@ -4526,6 +4938,7 @@ function connectSSE(){
       try{
         sseConnected = true;
         const d = JSON.parse(ev.data);
+        if (d.marketNames) _marketNames = d.marketNames;
         currentData = d;
         $('#hdr-ts').textContent = new Date(d.generatedAt).toLocaleString();
         renderSummary(d);
@@ -4555,6 +4968,13 @@ async function refresh(){
     if(!sseConnected) await fetchDashboardData();
   }catch(e){$('#hdr-ts').textContent='Error \u2014 retrying\u2026'}
 }
+
+/* ─── Logout ─── */
+$('#btn-logout').addEventListener('click', async ()=>{
+  if(!confirm('Sign out?')) return;
+  await fetch('/auth/logout',{method:'POST'});
+  location.href='/login';
+});
 
 /* ─── Boot ─── */
 fetchDashboardData();

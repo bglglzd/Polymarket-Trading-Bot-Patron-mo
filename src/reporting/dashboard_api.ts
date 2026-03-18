@@ -58,6 +58,7 @@ export function computePerformance(
   wallet: WalletState,
   trades: TradeRecord[],
   unrealizedPnl: number,
+  filteredRealizedPnl?: number,
 ): PerformanceSnapshot {
   // Compute real win rate from actual trades
   const wins = trades.filter((t) => t.realizedPnl > 0);
@@ -76,15 +77,16 @@ export function computePerformance(
         ? Infinity
         : 0;
 
-  // Sharpe-like ratio: PnL / capital
-  const totalPnl = wallet.realizedPnl + unrealizedPnl;
+  // Use filtered realized PnL if provided (inception date filtering)
+  const realizedPnl = filteredRealizedPnl ?? wallet.realizedPnl;
+  const totalPnl = realizedPnl + unrealizedPnl;
   const sharpeLike = Number(
     (totalPnl / Math.max(1, wallet.capitalAllocated)).toFixed(4),
   );
 
   return {
     walletId: wallet.walletId,
-    realizedPnl: wallet.realizedPnl,
+    realizedPnl,
     unrealizedPnl,
     totalPnl,
     winRate: Number(winRate.toFixed(4)),
@@ -104,29 +106,49 @@ export function buildDashboardPayload(
   marketPrices?: Map<string, number>,
   pausedWallets?: Set<string>,
   displayNames?: Map<string, string>,
+  inceptionDates?: Map<string, string>,
 ): DashboardPayload {
   const entries: WalletDashboardEntry[] = wallets.map((w) => {
-    const trades = tradesByWallet.get(w.walletId) ?? [];
+    const allTrades = tradesByWallet.get(w.walletId) ?? [];
+
+    // Apply inception date filter if configured
+    const cutoff = inceptionDates?.get(w.walletId)
+      ? new Date(inceptionDates.get(w.walletId)!).getTime()
+      : 0;
+    const trades = cutoff > 0 ? allTrades.filter((t) => t.timestamp >= cutoff) : allTrades;
+
+    // Identify markets that have post-inception trades (for position filtering)
+    const postInceptionMarkets = cutoff > 0
+      ? new Set(trades.map((t) => t.marketId))
+      : null;
+
+    // Compute filtered realized PnL from trades (not wallet state, which is unfiltered)
+    const filteredRealizedPnl = cutoff > 0
+      ? trades.reduce((s, t) => s + t.realizedPnl, 0)
+      : w.realizedPnl;
 
     // Compute unrealized PnL for each open position (skip zero-size)
     let walletUnrealizedPnl = 0;
-    const positions = w.openPositions.filter((p) => p.size > 0).map((p) => {
-      // Use live market price if available, otherwise use avgPrice (no unrealized PnL)
-      const currentPrice = marketPrices?.get(p.marketId) ?? p.avgPrice;
-      const unrealizedPnl =
-        p.size > 0 && p.avgPrice > 0
-          ? (currentPrice - p.avgPrice) * p.size
-          : 0;
-      walletUnrealizedPnl += unrealizedPnl;
-      return {
-        marketId: p.marketId,
-        outcome: p.outcome,
-        size: Number(p.size.toFixed(4)),
-        avgPrice: Number(p.avgPrice.toFixed(4)),
-        realizedPnl: Number(p.realizedPnl.toFixed(4)),
-        unrealizedPnl: Number(unrealizedPnl.toFixed(4)),
-      };
-    });
+    const positions = w.openPositions
+      .filter((p) => p.size > 0)
+      .filter((p) => !postInceptionMarkets || postInceptionMarkets.has(p.marketId))
+      .map((p) => {
+        // Use live market price if available, otherwise use avgPrice (no unrealized PnL)
+        const currentPrice = marketPrices?.get(p.marketId) ?? p.avgPrice;
+        const unrealizedPnl =
+          p.size > 0 && p.avgPrice > 0
+            ? (currentPrice - p.avgPrice) * p.size
+            : 0;
+        walletUnrealizedPnl += unrealizedPnl;
+        return {
+          marketId: p.marketId,
+          outcome: p.outcome,
+          size: Number(p.size.toFixed(4)),
+          avgPrice: Number(p.avgPrice.toFixed(4)),
+          realizedPnl: Number(p.realizedPnl.toFixed(4)),
+          unrealizedPnl: Number(unrealizedPnl.toFixed(4)),
+        };
+      });
 
     return {
       walletId: w.walletId,
@@ -135,13 +157,13 @@ export function buildDashboardPayload(
       strategy: w.assignedStrategy,
       capitalAllocated: w.capitalAllocated,
       availableBalance: Number(w.availableBalance.toFixed(4)),
-      realizedPnl: Number(w.realizedPnl.toFixed(4)),
+      realizedPnl: Number(filteredRealizedPnl.toFixed(4)),
       unrealizedPnl: Number(walletUnrealizedPnl.toFixed(4)),
-      totalPnl: Number((w.realizedPnl + walletUnrealizedPnl).toFixed(4)),
+      totalPnl: Number((filteredRealizedPnl + walletUnrealizedPnl).toFixed(4)),
       paused: pausedWallets?.has(w.walletId) ?? false,
       openPositions: positions,
       riskLimits: w.riskLimits,
-      performance: computePerformance(w, trades, walletUnrealizedPnl),
+      performance: computePerformance(w, trades, walletUnrealizedPnl, filteredRealizedPnl),
     };
   });
 

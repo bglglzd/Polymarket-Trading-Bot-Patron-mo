@@ -189,6 +189,13 @@ program
     const dashboardPort = Number(process.env.DASHBOARD_PORT ?? 3000);
     const dashboardServer = new DashboardServer(walletManager, dashboardPort);
 
+    /* ── Pass inception dates from config to dashboard ── */
+    for (const wallet of config.wallets) {
+      if (wallet.inceptionDate) {
+        dashboardServer.setInceptionDate(wallet.id, wallet.inceptionDate);
+      }
+    }
+
     /* ── Whale Tracking Engine ── */
     const rawConfig = YAML.parse(fs.readFileSync(options.config, 'utf8')) as Record<string, unknown>;
     const whaleConfigRaw = (rawConfig.whale_tracking ?? {}) as Record<string, unknown>;
@@ -220,6 +227,21 @@ program
     engine.start();
 
     writeState({ status: 'running', startedAt: new Date().toISOString() });
+
+    /* ── Graceful shutdown on SIGTERM / SIGINT ── */
+    let shuttingDown = false;
+    const shutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info({ signal }, 'Graceful shutdown initiated');
+      engine.stop();
+      dashboardServer.stop();
+      writeState({ status: 'stopped', stoppedAt: new Date().toISOString(), reason: signal });
+      // Allow pending I/O to flush (logs, Telegram), then exit
+      setTimeout(() => process.exit(0), 2000);
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
   });
 
 program

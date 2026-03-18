@@ -47,9 +47,11 @@ export class RiskEngine {
       return { ok: false, reason: 'Max daily loss breached' };
     }
 
-    /* ── Drawdown check ── */
+    /* ── Drawdown check (mark-to-market using current prices) ── */
+    const positionValue = this.getMarkToMarketValue(wallet);
+    const totalValue = wallet.availableBalance + positionValue;
     const drawdownPct = wallet.capitalAllocated > 0
-      ? (wallet.capitalAllocated - wallet.availableBalance - this.getTotalUnrealisedValue(wallet)) / wallet.capitalAllocated
+      ? Math.max(0, (wallet.capitalAllocated - totalValue) / wallet.capitalAllocated)
       : 0;
     if (drawdownPct > wallet.riskLimits.maxDrawdown) {
       return { ok: false, reason: `Drawdown ${(drawdownPct * 100).toFixed(1)}% exceeds limit ${(wallet.riskLimits.maxDrawdown * 100).toFixed(1)}%` };
@@ -62,6 +64,14 @@ export class RiskEngine {
       .reduce((s, p) => s + Math.abs(p.avgPrice * p.size), 0);
     if (existingExposure + orderCost > wallet.riskLimits.maxExposurePerMarket) {
       return { ok: false, reason: 'Max exposure per market exceeded' };
+    }
+
+    /* ── Global MLE check: total exposure across all markets ── */
+    const totalExposure = wallet.openPositions.reduce(
+      (s, p) => s + Math.abs(p.avgPrice * p.size), 0,
+    );
+    if (totalExposure + orderCost > wallet.capitalAllocated) {
+      return { ok: false, reason: `Global exposure $${(totalExposure + orderCost).toFixed(2)} would exceed capital $${wallet.capitalAllocated.toFixed(2)}` };
     }
 
     /* ── Rate limiting: max orders per minute per wallet ── */
@@ -95,10 +105,17 @@ export class RiskEngine {
     return cancels.length / orders.length;
   }
 
-  /** Approximate total unrealised value of open positions */
-  private getTotalUnrealisedValue(wallet: WalletState): number {
+  /**
+   * Mark-to-market value: use current market price if available on position,
+   * otherwise fall back to cost basis (avgPrice × size).
+   */
+  private getMarkToMarketValue(wallet: WalletState): number {
     return wallet.openPositions.reduce(
-      (sum, p) => sum + Math.abs(p.avgPrice * p.size),
+      (sum, p) => {
+        // If the position has a currentPrice field, use it; otherwise fall back to avgPrice
+        const price = (p as any).currentPrice ?? p.avgPrice;
+        return sum + Math.abs(price * p.size);
+      },
       0,
     );
   }

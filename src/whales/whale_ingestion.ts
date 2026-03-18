@@ -353,9 +353,10 @@ export class WhaleIngestion {
         const res = await fetch(url);
         if (res.ok) return res;
         if (res.status === 429) {
-          const retryAfter = parseInt(res.headers.get('retry-after') || '5', 10);
-          logger.warn({ retryAfter, attempt }, 'Rate limited, backing off');
-          await this.sleep(retryAfter * 1000);
+          const hdr = parseInt(res.headers.get('retry-after') || '0', 10);
+          const backoff = Math.max(hdr, 2) * 1000 * Math.pow(2, attempt); // min 2s, exponential
+          logger.warn({ backoffMs: backoff, attempt }, 'Rate limited, backing off');
+          await this.sleep(backoff);
           continue;
         }
         if (res.status >= 500) {
