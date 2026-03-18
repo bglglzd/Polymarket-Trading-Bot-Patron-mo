@@ -3,6 +3,8 @@ import { Signal, MarketData, OrderRequest } from '../../types';
 import { ClaudeAnalyzer } from './claude_analyzer';
 import { consoleLog } from '../../reporting/console_log';
 import { logger } from '../../reporting/logs';
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    PolyPatronBot AI Forecast Strategy — Active Trading
@@ -23,12 +25,12 @@ import { logger } from '../../reporting/logs';
 /* ── Market filters ── */
 const MIN_VOLUME = 1_000;
 const MIN_LIQUIDITY = 500;
-const MIN_HISTORY = 8;
+const MIN_HISTORY = 3;          // low to reduce cold-start time (3 polls × 2 min = 6 min)
 const MAX_HISTORY = 60;
 const PRICE_FLOOR = 0.15;
 const PRICE_CEILING = 0.85;
 const MAX_SPREAD = 0.05;       // skip markets with > 5¢ spread (500bps)
-const MAX_POSITIONS = 5;
+const MAX_POSITIONS = 10;
 
 /* ── Position sizing ── */
 const RISK_PCT = 0.08;          // risk 8% of capital per trade
@@ -44,7 +46,7 @@ const TIME_EXIT_MS = 24 * 3600_000; // exit after 24h if not meaningfully profit
 const FEE_PCT = 0.02;           // Polymarket ~2% fee per trade
 
 /* ── Claude thresholds ── */
-const MIN_CONFIDENCE = 0.50;    // lowered from 0.55 — Claude's 0.52 is a valid signal
+const MIN_CONFIDENCE = 0.30;    // Claude is often conservative; 0.30 lets viable signals through
 const MIN_EDGE = 0.015;         // 1.5% edge minimum (covers fees)
 
 type Regime = 'trending' | 'ranging' | 'volatile';
@@ -66,6 +68,8 @@ interface EntryRecord {
   highWaterMark: number;
 }
 
+const ENTRY_RECORDS_FILE = join(process.cwd(), 'entry-records.json');
+
 export class AiForecastStrategy extends BaseStrategy {
   readonly name = 'ai_forecast';
   protected override cooldownMs = 300_000; // 5 min per-market cooldown
@@ -83,6 +87,35 @@ export class AiForecastStrategy extends BaseStrategy {
   private pendingSells = new Set<string>();
   private failedSells = new Set<string>();
   private conditionToGammaId = new Map<string, string>();
+
+  constructor() {
+    super();
+    this.loadEntryRecords();
+  }
+
+  private loadEntryRecords(): void {
+    try {
+      const raw = readFileSync(ENTRY_RECORDS_FILE, 'utf-8');
+      const data = JSON.parse(raw) as { entries: Array<[string, EntryRecord]>; condMap: Array<[string, string]> };
+      this.entryRecords = new Map(data.entries);
+      this.conditionToGammaId = new Map(data.condMap);
+      logger.info({ count: this.entryRecords.size }, 'Loaded persisted entry records');
+    } catch {
+      // No file or parse error — start fresh
+    }
+  }
+
+  private saveEntryRecords(): void {
+    try {
+      const data = {
+        entries: [...this.entryRecords.entries()],
+        condMap: [...this.conditionToGammaId.entries()],
+      };
+      writeFileSync(ENTRY_RECORDS_FILE, JSON.stringify(data), 'utf-8');
+    } catch (err: any) {
+      logger.warn({ error: err.message }, 'Failed to persist entry records');
+    }
+  }
 
   /* ── Market update ──────────────────────────────────────────── */
   override onMarketUpdate(data: MarketData): void {
@@ -106,10 +139,33 @@ export class AiForecastStrategy extends BaseStrategy {
   }
 
   private lastGcTime = 0;
+  private lastAuditTime = 0;
+  private auditStats = { entered: 0, exited: 0, profitableExits: 0, totalPnl: 0, skippedSignals: 0 };
 
   /* ── Timer: trigger Claude analysis for promising markets ──── */
   override onTimer(): void {
     const now = Date.now();
+
+    // Performance self-audit every 12 hours
+    if (now - this.lastAuditTime > 12 * 3600_000) {
+      this.lastAuditTime = now;
+      const s = this.auditStats;
+      const winRate = s.exited > 0 ? s.profitableExits / s.exited : 0;
+      logger.info({
+        periodHours: 12,
+        entered: s.entered,
+        exited: s.exited,
+        profitableExits: s.profitableExits,
+        winRate: Number(winRate.toFixed(2)),
+        totalPnl: Number(s.totalPnl.toFixed(2)),
+        skippedSignals: s.skippedSignals,
+        openPositions: this.entryRecords.size,
+        currentConfThreshold: MIN_CONFIDENCE,
+        currentEdgeThreshold: MIN_EDGE,
+      }, 'SELF-AUDIT: 12h performance review');
+      // Reset counters for next period
+      this.auditStats = { entered: 0, exited: 0, profitableExits: 0, totalPnl: 0, skippedSignals: 0 };
+    }
 
     // Periodic GC: evict low-value markets (every 10 min)
     if (now - this.lastGcTime > 600_000) {
@@ -127,6 +183,8 @@ export class AiForecastStrategy extends BaseStrategy {
       if (evicted > 0) {
         logger.info({ evicted, remaining: this.markets.size }, 'GC: evicted low-value markets');
       }
+      // Persist entry records periodically (captures HWM updates)
+      if (this.entryRecords.size > 0) this.saveEntryRecords();
     }
 
     // Clean up stale open-order markers (5 min expiry)
@@ -145,13 +203,33 @@ export class AiForecastStrategy extends BaseStrategy {
       }
     }
 
+    // GC entry records for positions no longer in wallet (sold/resolved)
+    const openPosIds = new Set((this.context?.wallet.openPositions ?? []).map((p) => p.marketId));
+    let gcEntries = 0;
+    for (const [mId, entry] of this.entryRecords) {
+      const condId = entry.conditionId;
+      // Keep if position still exists (by marketId or conditionId)
+      if (openPosIds.has(mId)) continue;
+      if (condId && openPosIds.has(condId)) continue;
+      // Keep for 5 min after entry (position may not appear in sync yet)
+      if (now - entry.entryTime < 300_000) continue;
+      this.entryRecords.delete(mId);
+      this.pendingSells.delete(mId);
+      this.failedSells.delete(mId);
+      gcEntries++;
+    }
+    if (gcEntries > 0) {
+      logger.info({ gcEntries, remaining: this.entryRecords.size }, 'GC: cleaned up resolved entry records');
+      this.saveEntryRecords();
+    }
+
     if (!this.claude.isEnabled()) return;
 
     const ourPositionCount = this.entryRecords.size;
     if (ourPositionCount >= MAX_POSITIONS) return;
 
     // Send promising markets to Claude for analysis
-    const MAX_PENDING_ANALYSES = 3;
+    const MAX_PENDING_ANALYSES = 5;
     for (const [marketId, market] of this.markets) {
       if (this.pendingAnalysis.size >= MAX_PENDING_ANALYSES) break;
       if (this.pendingAnalysis.has(marketId)) continue;
@@ -167,14 +245,8 @@ export class AiForecastStrategy extends BaseStrategy {
       const volumes = this.volumeHistory.get(marketId) ?? [];
       if (prices.length < MIN_HISTORY) continue;
 
-      const regime = this.detectRegime(prices);
-      const factors = this.runFactors(marketId, market, prices, volumes, regime);
-
-      // Need at least 1 directional quant factor to trigger Claude
-      const yesCount = factors.filter((f) => f.direction === 'YES').length;
-      const noCount = factors.filter((f) => f.direction === 'NO').length;
-      if (Math.max(yesCount, noCount) < 1) continue;
-
+      // Send to Claude for analysis — quant factors are used for confidence boost,
+      // not as a gate. Claude is the primary decision maker.
       const promise = this.claude
         .analyzeMarket(marketId, {
           question: market.question ?? market.slug ?? marketId,
@@ -191,7 +263,7 @@ export class AiForecastStrategy extends BaseStrategy {
             momentum: this.factorMomentum(prices).direction,
             meanReversion: this.factorMeanReversion(prices).direction,
             volumeDivergence: this.factorVolumePriceDivergence(prices, volumes).direction,
-            regime,
+            regime: this.detectRegime(prices),
             acceleration: this.factorAcceleration(prices).direction,
             liquidityQuality: this.factorLiquidity(market).direction,
           },
@@ -269,6 +341,7 @@ export class AiForecastStrategy extends BaseStrategy {
 
       // Check confidence and edge thresholds
       if (claudeResult.confidence < MIN_CONFIDENCE || claudeResult.edge < MIN_EDGE) {
+        this.auditStats.skippedSignals++;
         logger.info(
           { marketId, conf: claudeResult.confidence, edge: claudeResult.edge },
           `Skipped: conf=${claudeResult.confidence.toFixed(2)} edge=${claudeResult.edge.toFixed(3)} below threshold`,
@@ -326,21 +399,25 @@ export class AiForecastStrategy extends BaseStrategy {
 
     for (const signal of signals) {
       const market = this.markets.get(signal.marketId);
-      if (!market) continue;
+      if (!market) {
+        logger.info({ marketId: signal.marketId }, 'sizePositions: market not found');
+        continue;
+      }
 
       // Resolve CLOB token ID
+      // YES → index 0, NO → index 1 (works for both Yes/No and named-outcome markets)
       let tokenId: string | undefined;
-      if (market.clobTokenIds && market.outcomes) {
-        const outcomeIdx = market.outcomes.findIndex(
-          (o) => o.toUpperCase() === signal.outcome,
-        );
-        if (outcomeIdx >= 0 && outcomeIdx < market.clobTokenIds.length) {
-          tokenId = market.clobTokenIds[outcomeIdx];
-        }
+      if (market.clobTokenIds && market.clobTokenIds.length >= 2) {
+        const idx = signal.outcome === 'YES' ? 0 : 1;
+        tokenId = market.clobTokenIds[idx];
       }
 
       if (!tokenId) {
-        consoleLog.info('STRATEGY', `Skipping ${signal.marketId.slice(0, 12)}… — no token ID`);
+        logger.info({
+          marketId: signal.marketId.slice(0, 16),
+          signalOutcome: signal.outcome,
+          clobTokenCount: market.clobTokenIds?.length ?? 0,
+        }, 'sizePositions: no token ID');
         continue;
       }
 
@@ -364,27 +441,19 @@ export class AiForecastStrategy extends BaseStrategy {
       const size = Math.max(MIN_SHARES, Math.min(maxShares, MAX_SHARES));
 
       const orderCost = price * size;
-      if (orderCost > capital * 0.15) continue; // safety: don't spend >15% in one order
-      if (orderCost > capital - 3) continue; // keep $3 reserve
+      if (orderCost > capital * 0.15) {
+        logger.info({ marketId: signal.marketId.slice(0, 16), orderCost, limit: capital * 0.15, capital }, 'sizePositions: order > 15% capital');
+        continue;
+      }
+      if (orderCost > capital - 3) {
+        logger.info({ marketId: signal.marketId.slice(0, 16), orderCost, capital }, 'sizePositions: would exceed $3 reserve');
+        continue;
+      }
 
-      // Record cooldowns
+      // Set cooldowns (prevent duplicate orders while this one is in flight)
       this.orderCooldowns.set(signal.marketId, now);
       this.openOrderMarkets.add(signal.marketId);
       this.lastGlobalOrderTime = now;
-
-      // Record entry for position management
-      const condId = market.conditionId;
-      this.entryRecords.set(signal.marketId, {
-        marketId: signal.marketId,
-        conditionId: condId,
-        outcome: signal.outcome,
-        entryPrice: price,
-        entryTime: now,
-        highWaterMark: 0,
-      });
-      if (condId) {
-        this.conditionToGammaId.set(condId, signal.marketId);
-      }
 
       consoleLog.success(
         'STRATEGY',
@@ -406,13 +475,31 @@ export class AiForecastStrategy extends BaseStrategy {
     return orders;
   }
 
-  /* ── Position tracking callback ──────────────────────────────── */
+  /* ── Position tracking callback (only called on successful execution) ── */
   override notifyFill(order: OrderRequest): void {
     if (order.strategy !== this.name) return;
     this.openOrderMarkets.add(order.marketId);
+
+    // Create entry record for position management (only after confirmed fill)
+    const market = this.markets.get(order.marketId);
+    const condId = market?.conditionId;
+    this.entryRecords.set(order.marketId, {
+      marketId: order.marketId,
+      conditionId: condId,
+      outcome: order.outcome,
+      entryPrice: order.price,
+      entryTime: Date.now(),
+      highWaterMark: 0,
+    });
+    if (condId) {
+      this.conditionToGammaId.set(condId, order.marketId);
+    }
+    this.auditStats.entered++;
+    this.saveEntryRecords();
+
     consoleLog.info(
       'STRATEGY',
-      `Order accepted: ${order.side} ${order.outcome} ×${order.size} @ $${order.price.toFixed(2)} on ${order.marketId.slice(0, 20)}…`,
+      `Order filled: ${order.side} ${order.outcome} ×${order.size} @ $${order.price.toFixed(2)} on ${order.marketId.slice(0, 20)}…`,
     );
   }
 
@@ -500,15 +587,11 @@ export class AiForecastStrategy extends BaseStrategy {
 
       if (!shouldSell) continue;
 
-      // Resolve token ID
+      // Resolve token ID: YES → index 0, NO → index 1
       let tokenId: string | undefined;
-      if (market.clobTokenIds && market.outcomes) {
-        const outcomeIdx = market.outcomes.findIndex(
-          (o) => o.toUpperCase() === pos.outcome,
-        );
-        if (outcomeIdx >= 0 && outcomeIdx < market.clobTokenIds.length) {
-          tokenId = market.clobTokenIds[outcomeIdx];
-        }
+      if (market.clobTokenIds && market.clobTokenIds.length >= 2) {
+        const idx = pos.outcome === 'YES' ? 0 : 1;
+        tokenId = market.clobTokenIds[idx];
       }
 
       if (!tokenId) {
@@ -531,6 +614,9 @@ export class AiForecastStrategy extends BaseStrategy {
 
       this.pendingSells.add(posKey);
       if (entry) entry.exitSubmittedAt = now;
+      this.auditStats.exited++;
+      this.auditStats.totalPnl += estProfit;
+      if (estProfit > 0) this.auditStats.profitableExits++;
 
       this.pendingExits.push({
         walletId,

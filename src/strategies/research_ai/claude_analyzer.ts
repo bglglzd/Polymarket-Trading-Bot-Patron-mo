@@ -91,7 +91,7 @@ export class ClaudeAnalyzer {
   private consecutiveFailures = 0;
   private maxConsecutiveFailures = 5;
   private readonly cache = new Map<string, { analysis: MarketAnalysis; timestamp: number }>();
-  private cacheTtlMs = 180_000; // 3 min cache (prediction markets move fast)
+  private cacheTtlMs = 600_000; // 10 min cache — accumulate more analyses before expiry
   private callTimeoutMs = 45_000;
 
   constructor() {

@@ -1,178 +1,30 @@
 # PolyPatronBot — AI-powered Polymarket trading platform
-# Single-wallet setup with Claude AI analysis
+# Single live wallet with Claude AI forecast strategy
 
 environment:
   enable_live_trading: true
 
 wallets:
-  # Paper wallet (paused for now)
-  # - id: patron_paper
-  #   mode: PAPER
-  #   strategy: ai_forecast
-  #   capital: 100
-  #   risk_limits:
-  #     max_position_size: 20
-  #     max_exposure_per_market: 30
-  #     max_daily_loss: 10
-  #     max_open_trades: 10
-  #     max_drawdown: 0.10
-
-  # LIVE wallet — real money
   - id: patron_live
     mode: LIVE
     strategy: ai_forecast
     capital: 99.36
     inception_date: "2026-03-14T22:50:00Z"  # ignore manual trades before bot started
     risk_limits:
-      max_position_size: 25
-      max_exposure_per_market: 20
-      max_daily_loss: 15        # cumulative PnL limit (includes past losses from spam bug)
-      max_open_trades: 15        # room for ~5 legacy + 5 new positions
-      max_drawdown: 0.15        # 15% drawdown limit from starting capital
+      max_position_size: 25       # max $25 per position
+      max_exposure_per_market: 20  # max $20 per market
+      max_daily_loss: 15           # stop trading after $15 daily loss
+      max_open_trades: 25          # max simultaneous positions (includes pre-existing manual trades)
+      max_drawdown: 0.15           # 15% drawdown circuit breaker
 
 strategy_config:
   ai_forecast:
     refresh_minutes: 15
-  filtered_high_prob_convergence:
-    enabled: true
-    min_liquidity_usd: 10000
-    min_prob: 0.65
-    max_prob: 0.96
-    max_spread_bps: 200
-    max_days_to_resolution: 14
-    spike_pct: 0.08
-    spike_lookback_minutes: 60
-    min_depth_usd_within_1pct: 500
-    min_imbalance: 0.10
-    flow_lookback_minutes: 15
-    min_net_buy_flow_usd: 500
-    max_correlated_exposure_pct: 0.25
-    base_risk_pct: 0.005
-    max_position_usd_per_market: 200
-    max_total_open_positions: 10
-    take_profit_bps: 200
-    stop_loss_bps: 150
-    time_exit_hours: 48
-    max_daily_loss_pct: 0.03
-    max_weekly_drawdown_pct: 0.08
-    max_market_mle_pct: 0.05
-    max_total_mle_pct: 0.15
-    max_orders_per_minute: 10
-  cross_market_arbitrage:
-    min_edge: 0.03
-  mispricing_arbitrage:
-    min_dislocation: 0.02
-  market_making:
-    spread_bps: 40
-  momentum:
-    lookback_minutes: 15
-  copy_trade:
-    whale_addresses: []
-    copy_mode: mirror
-    data_api_url: https://data-api.polymarket.com
-    poll_interval_seconds: 30
-    max_trade_age_seconds: 120
-    min_trade_size_usd: 50
-    max_trade_size_usd: 100000
-    size_mode: fixed
-    fixed_size: 10
-    max_open_positions: 15
-    max_exposure_per_market_usd: 500
-    max_daily_volume_usd: 5000
-    take_profit_bps: 150
-    stop_loss_bps: 100
-    time_exit_minutes: 120
-    exit_on_whale_exit: true
 
 polymarket:
   gamma_api: https://gamma-api.polymarket.com
   clob_api: https://clob.polymarket.com
 
-# Whale Tracking Engine
+# Whale Tracking Engine (disabled — not in use)
 whale_tracking:
-  enabled: true
-  dbPath: .runtime/whales.db
-  pollIntervalMs: 30000
-  backfillBatchSize: 100
-  maxRequestsPerMinute: 60
-  backoffBaseMs: 1000
-  backoffMaxMs: 60000
-  candidateScanIntervalMs: 300000
-  candidateMinVolumeUsd24h: 5000
-  candidateMinTrades24h: 5
-  candidateAutoTrackTopK: 5
-  scoreVersion: "1.0.0"
-  scoreWeights:
-    profitability: 0.30
-    timingSkill: 0.20
-    lowSlippage: 0.15
-    consistency: 0.15
-    marketSelectionQuality: 0.10
-    recencyActiveness: 0.10
-  provisionalMinTrades: 30
-  provisionalMaxScore: 65
-  costBasisMethod: FIFO
-  timingWindows: [5, 30, 240, 1440]
-  alertDigestIntervalMs: 60000
-  largeTradeSigmaThreshold: 2.5
-  nearResolutionHours: 24
-  copy:
-    maxCopyDelaySeconds: 120
-    maxEntryDriftBps: 50
-    maxSpreadBps: 200
-    minDepthUsd: 1000
-    minLiquidityUsd: 5000
-    maxSizePerTradeUsd: 100
-    maxSizePerMarketUsd: 500
-    maxSizePerDayUsd: 2000
-    stopCopyDrawdownPct: 0.10
-    stopCopyMinScore: 40
-    minShadowWindowDays: 7
-  reconcileIntervalMs: 86400000
-  reconcileLookbackDays: 7
-  metadataCacheTtlMs: 3600000
-  scanner:
-    enabled: true
-    scanIntervalMs: 900000
-    marketsPerScan: 25
-    minMarketVolume24hUsd: 10000
-    minMarketLiquidityUsd: 10000
-    tradesPerMarket: 200
-    tradePageDepth: 2
-    minAddressTrades: 5
-    minAddressVolumeUsd: 5000
-    minWinRate: 0.52
-    minRoi: -0.10
-    autoPromoteEnabled: true
-    autoPromoteMinScore: 60
-    autoPromoteMaxPerScan: 10
-    bigTradeMinUsd: 3000
-    crossRefEnabled: true
-    crossRefMaxPerBatch: 15
-    clusterDetectionEnabled: true
-    clusterMinWhales: 2
-    clusterWindowHours: 48
-    parallelFetchBatch: 4
-    apiPool:
-      enabled: true
-      selectionStrategy: least-loaded
-      healthCheckIntervalMs: 120000
-    fastScan:
-      enabled: true
-      intervalMs: 60000
-      topMarkets: 5
-      alertMinUsd: 5000
-    backfillDays: 7
-    polygonRpcUrl: https://polygon-rpc.com
-    usdcContractAddress: "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    networkGraphEnabled: true
-    copySimEnabled: true
-    copySimSlippageBps: 30
-    copySimDelaySeconds: 10
-    regimeAdaptiveEnabled: true
-    exchangeSources:
-      - exchange: polymarket
-        apiUrl: https://data-api.polymarket.com
-        enabled: true
-        maxRequestsPerMinute: 60
-  telegramWebhookUrl: null
+  enabled: false

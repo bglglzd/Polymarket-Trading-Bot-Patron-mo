@@ -48,9 +48,15 @@ export class PolymarketWallet {
   /** Etherscan balance cache with 5-minute TTL */
   private etherscanCache: { balance: number; ts: number } | null = null;
   private static readonly ETHERSCAN_CACHE_TTL = 5 * 60_000;
-  /** Simple CLOB rate limiter: min 500ms between API calls */
+  /** Simple CLOB rate limiter: min 2s between API calls to avoid Cloudflare 1015 */
   private lastClobCallTime = 0;
-  private static readonly CLOB_MIN_INTERVAL = 500;
+  private static readonly CLOB_MIN_INTERVAL = 2000;
+  /** Cache tick sizes to avoid repeated getTickSize calls */
+  private tickSizeCache = new Map<string, string>();
+  /** Backoff after rate-limit hits — pauses order placement */
+  private rateLimitBackoff = 0;
+  /** Timestamp when orders can resume after rate limit */
+  private orderPauseUntil = 0;
 
   constructor(config: WalletConfig, assignedStrategy: string) {
     this.state = {
@@ -71,6 +77,14 @@ export class PolymarketWallet {
     };
     this.displayName = config.id;
     this.initialDeposit = config.capital;
+    logger.info({
+      walletId: config.id,
+      maxOpenTrades: this.state.riskLimits.maxOpenTrades,
+      maxPositionSize: this.state.riskLimits.maxPositionSize,
+      maxExposurePerMarket: this.state.riskLimits.maxExposurePerMarket,
+      maxDailyLoss: this.state.riskLimits.maxDailyLoss,
+      maxDrawdown: this.state.riskLimits.maxDrawdown,
+    }, 'Wallet risk limits initialized');
     this.initClob();
   }
 
@@ -132,8 +146,8 @@ export class PolymarketWallet {
       await this.syncTradesFromClob();
       this.firstSyncDone = true;
 
-      // Periodically sync trades every 60s
-      this.syncTimer = setInterval(() => this.syncTradesFromClob(), 60_000);
+      // Periodically sync trades every 120s (reduce CLOB API load)
+      this.syncTimer = setInterval(() => this.syncTradesFromClob(), 120_000);
 
       // Auto-claim: initialize redeemer and scan every 5 minutes
       const proxyAddr = process.env.POLYMARKET_PROXY_ADDRESS;
@@ -190,7 +204,7 @@ export class PolymarketWallet {
     return this.marketNames.get(conditionId);
   }
 
-  /** Wait for CLOB rate limit (min 500ms between calls) */
+  /** Wait for CLOB rate limit (base interval only — backoff handled by orderPauseUntil) */
   private async clobRateWait(): Promise<void> {
     const now = Date.now();
     const wait = PolymarketWallet.CLOB_MIN_INTERVAL - (now - this.lastClobCallTime);
@@ -585,6 +599,13 @@ export class PolymarketWallet {
       return;
     }
 
+    // Skip orders while rate-limited (throw so engine knows the order failed)
+    if (Date.now() < this.orderPauseUntil) {
+      const remaining = Math.round((this.orderPauseUntil - Date.now()) / 1000);
+      logger.info({ remaining, walletId: this.state.walletId }, 'Order skipped — CLOB rate limit cooldown');
+      throw new Error('CLOB rate limited — order paused');
+    }
+
     // The CLOB API requires the actual token ID (one per outcome), not the Gamma market/condition ID.
     const tokenID = request.tokenId ?? request.marketId;
     if (!request.tokenId) {
@@ -596,13 +617,16 @@ export class PolymarketWallet {
     const side = request.side === 'BUY' ? Side.BUY : Side.SELL;
 
     try {
-      // Get tick size for this token (rate-limited)
-      let tickSize = '0.01'; // default
-      try {
-        await this.clobRateWait();
-        tickSize = await this.clob.getTickSize(tokenID);
-      } catch {
-        // Use default
+      // Get tick size (cached to avoid excess API calls)
+      let tickSize = this.tickSizeCache.get(tokenID) ?? '0.01';
+      if (!this.tickSizeCache.has(tokenID)) {
+        try {
+          await this.clobRateWait();
+          tickSize = await this.clob.getTickSize(tokenID);
+          this.tickSizeCache.set(tokenID, tickSize);
+        } catch {
+          // Use default
+        }
       }
 
       logger.info(
@@ -709,9 +733,24 @@ export class PolymarketWallet {
         throw new Error(`Order rejected: ${typeof errMsg === 'string' ? errMsg.slice(0, 100) : errMsg}`);
       }
     } catch (err: any) {
+      // Detect rate limiting (Cloudflare 1015 / HTTP 429 / HTML error page)
+      const errStr = err.message ?? '';
+      if (errStr.includes('1015') || errStr.includes('429') || errStr.includes('rate limit')
+          || errStr.includes('Too Many') || errStr.includes('<!DOCTYPE') || errStr.includes('Cloudflare')) {
+        // Exponential backoff: 30min → 60min → 120min (max)
+        // Cloudflare bans last 1-4h; short retries extend the ban
+        this.rateLimitBackoff = this.rateLimitBackoff > 0
+          ? Math.min(120 * 60_000, this.rateLimitBackoff * 2)
+          : 30 * 60_000;
+        this.orderPauseUntil = Date.now() + this.rateLimitBackoff;
+        logger.warn(
+          { pauseMinutes: Math.round(this.rateLimitBackoff / 60_000), marketId: request.marketId },
+          'CLOB rate limited — pausing orders',
+        );
+      }
       logger.error(
         {
-          error: err.message,
+          error: err.message?.slice(0, 200),
           marketId: request.marketId,
           side: request.side,
           price: request.price,

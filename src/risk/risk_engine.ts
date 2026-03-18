@@ -40,7 +40,7 @@ export class RiskEngine {
     }
 
     if (wallet.openPositions.length >= wallet.riskLimits.maxOpenTrades) {
-      return { ok: false, reason: 'Max open trades exceeded' };
+      return { ok: false, reason: `Max open trades exceeded (${wallet.openPositions.length} >= ${wallet.riskLimits.maxOpenTrades})` };
     }
 
     if (wallet.realizedPnl <= -wallet.riskLimits.maxDailyLoss) {
