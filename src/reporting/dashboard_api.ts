@@ -116,7 +116,24 @@ export function buildDashboardPayload(
     const cutoff = inceptionDates?.get(w.walletId)
       ? new Date(inceptionDates.get(w.walletId)!).getTime()
       : 0;
-    const trades = cutoff > 0 ? allTrades.filter((t) => t.timestamp >= cutoff) : allTrades;
+    // Exclude resolution trades for pre-existing/manual positions:
+    // 1) Markets with NO non-resolution BUY trades → entirely pre-existing positions
+    // 2) Markets with any single BUY order > maxExposurePerMarket → manual trades
+    const postInception = cutoff > 0 ? allTrades.filter((t) => t.timestamp >= cutoff) : allTrades;
+    const manualThreshold = w.riskLimits.maxExposurePerMarket;
+    const botBuyMarkets = new Set<string>();
+    const oversizedBuyMarkets = new Set<string>();
+    for (const t of postInception) {
+      if (t.side === 'BUY' && !t.orderId.startsWith('resolution-')) {
+        botBuyMarkets.add(t.marketId);
+        if (t.cost > manualThreshold) oversizedBuyMarkets.add(t.marketId);
+      }
+    }
+    const trades = postInception
+      .filter((t) => {
+        if (!t.orderId.startsWith('resolution-')) return true;
+        return botBuyMarkets.has(t.marketId) && !oversizedBuyMarkets.has(t.marketId);
+      });
 
     // Compute unrealized PnL from ALL positions (not filtered — they all affect portfolio value)
     // Use data API curPrice (outcome-aware) over orderbook midPrice (YES-only)

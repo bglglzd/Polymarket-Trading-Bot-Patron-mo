@@ -199,6 +199,7 @@ export function getLoginPageHtml(): string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PolyPatronBot — Login</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23111'/><text x='16' y='23' text-anchor='middle' font-size='20' font-family='sans-serif' font-weight='bold' fill='%2300d4aa'>P</text></svg>">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {

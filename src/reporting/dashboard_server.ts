@@ -83,7 +83,29 @@ import type { WalletState, TradeRecord, Position } from '../types';
 
 function buildWalletDetail(wallet: WalletState, trades: TradeRecord[], marketPrices?: Map<string, number>, inceptionDate?: string) {
   const cutoff = inceptionDate ? new Date(inceptionDate).getTime() : 0;
-  const sorted = [...trades].filter((t) => t.timestamp >= cutoff).sort((a, b) => a.timestamp - b.timestamp);
+
+  // Filter trades to post-inception only
+  const postInception = trades.filter((t) => t.timestamp >= cutoff);
+
+  // Exclude resolution trades for pre-existing/manual positions:
+  // 1) Markets with NO non-resolution BUY trades → entirely pre-existing positions
+  // 2) Markets with any single BUY order > maxExposurePerMarket → manual trades
+  const manualThreshold = wallet.riskLimits.maxExposurePerMarket;
+  const botBuyMarkets = new Set<string>();
+  const oversizedBuyMarkets = new Set<string>();
+  for (const t of postInception) {
+    if (t.side === 'BUY' && !t.orderId.startsWith('resolution-')) {
+      botBuyMarkets.add(t.marketId);
+      if (t.cost > manualThreshold) oversizedBuyMarkets.add(t.marketId);
+    }
+  }
+  const sorted = postInception
+    .filter((t) => {
+      if (!t.orderId.startsWith('resolution-')) return true;
+      // Keep resolution only if the bot bought into this market and no single buy was oversized
+      return botBuyMarkets.has(t.marketId) && !oversizedBuyMarkets.has(t.marketId);
+    })
+    .sort((a, b) => a.timestamp - b.timestamp);
 
   /* ── All open positions (no filtering — they all affect portfolio value) ── */
   const allPositions = wallet.openPositions.filter((p) => p.size > 0);
@@ -961,6 +983,14 @@ export class DashboardServer {
       return;
     }
 
+    /* ─── Favicon (public) ─── */
+    if (path === '/favicon.ico') {
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#111"/><text x="16" y="23" text-anchor="middle" font-size="20" font-family="sans-serif" font-weight="bold" fill="#00d4aa">P</text></svg>`;
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' });
+      res.end(svg);
+      return;
+    }
+
     /* ─── Auth gate — everything below requires a valid session ─── */
     if (!authMiddleware(req, res)) return;
 
@@ -1523,6 +1553,7 @@ function getDashboardHtml(): string {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PolyPatronBot Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23111'/><text x='16' y='23' text-anchor='middle' font-size='20' font-family='sans-serif' font-weight='bold' fill='%2300d4aa'>P</text></svg>">
 <style>
 /* ═══ Design tokens ═══ */
 :root {
