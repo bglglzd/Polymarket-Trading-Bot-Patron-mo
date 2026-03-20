@@ -1,0 +1,6 @@
+poly.qzx.digital {
+	encode gzip zstd
+	reverse_proxy localhost:3000 {
+		flush_interval -1
+	}
+}
