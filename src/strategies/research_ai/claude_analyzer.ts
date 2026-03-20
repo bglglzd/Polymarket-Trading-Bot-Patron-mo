@@ -90,8 +90,11 @@ export class ClaudeAnalyzer {
   private minIntervalMs = 10_000; // 10s between calls
   private consecutiveFailures = 0;
   private maxConsecutiveFailures = 5;
+  /** When disabled by failures, auto-retry after this cooldown */
+  private disabledUntil = 0;
+  private retryCooldownMs = 10 * 60_000; // retry every 10 min after failures
   private readonly cache = new Map<string, { analysis: MarketAnalysis; timestamp: number }>();
-  private cacheTtlMs = 600_000; // 10 min cache — accumulate more analyses before expiry
+  private cacheTtlMs = 600_000; // 10 min cache
   private callTimeoutMs = 45_000;
 
   constructor() {
@@ -107,6 +110,13 @@ export class ClaudeAnalyzer {
   }
 
   isEnabled(): boolean {
+    if (!this.enabled && this.disabledUntil > 0 && Date.now() > this.disabledUntil) {
+      // Auto-recover: re-enable after cooldown
+      logger.info('Claude auto-recovery: re-enabling after cooldown');
+      this.enabled = true;
+      this.consecutiveFailures = 0;
+      this.disabledUntil = 0;
+    }
     return this.enabled;
   }
 
@@ -122,7 +132,7 @@ export class ClaudeAnalyzer {
   }
 
   async analyzeMarket(marketId: string, ctx: MarketContext): Promise<MarketAnalysis | null> {
-    if (!this.enabled) return null;
+    if (!this.isEnabled()) return null;
 
     // Check cache
     const cached = this.cache.get(marketId);
@@ -165,9 +175,11 @@ export class ClaudeAnalyzer {
       );
 
       if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+        // Don't permanently disable — set a cooldown and retry later
+        this.disabledUntil = Date.now() + this.retryCooldownMs;
         logger.warn(
-          { failures: this.consecutiveFailures },
-          'Too many consecutive Claude failures — disabling AI analysis, quant-only mode',
+          { failures: this.consecutiveFailures, retryInMinutes: Math.round(this.retryCooldownMs / 60_000) },
+          'Claude disabled temporarily — will auto-retry after cooldown',
         );
         this.enabled = false;
       }
